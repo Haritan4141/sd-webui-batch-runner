@@ -30,6 +30,12 @@ class SdWebuiClient:
     def txt2img(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request_json("POST", "sdapi/v1/txt2img", payload)
 
+    def interrupt(self) -> dict[str, Any]:
+        return self._request_json("POST", "sdapi/v1/interrupt")
+
+    def skip(self) -> dict[str, Any]:
+        return self._request_json("POST", "sdapi/v1/skip")
+
     def _request_json(
         self,
         method: str,

@@ -15,11 +15,11 @@ Stable Diffusion WebUIをAPI有効で起動してください。
 プロンプト開始行は固定文字列ではありません。各 `・タイトル` 行の次から、次の `・タイトル` またはファイル末尾までをそのままプロンプトとして扱います。
 
 ```text
-・タイトル1：ノーマル
+・タイトル1：A
 AAAA,
 masterpiece, best quality, amazing quality,
 
-・タイトル2：ヌルテカ
+・タイトル2：B
 BBBB,
 masterpiece, best quality, amazing quality,
 ```
@@ -27,6 +27,21 @@ masterpiece, best quality, amazing quality,
 出力サブディレクトリには、`・` を除いたタイトルを使います。
 
 ## 実行例
+
+GUIを起動します。
+
+```powershell
+python -m sd_webui_batch.gui
+```
+
+Windowsでは `run_gui.bat` をダブルクリックして起動することもできます。
+
+GUIでは、プロンプトファイル、Payload JSON、WebUI URL、生成枚数、Batch Size、基本生成設定、Hires. fix、Checkpoint / VAE / Clip Skip、先頭N件だけ実行、Dry Run、生成開始、WebUI Interrupt / Skipを操作できます。
+
+`Dry Run` は画像生成せず、WebUIへ送る予定のpayloadをログに表示します。
+`Payload JSON` の `保存` は、GUI上の設定をJSONファイルへ書き戻します。
+
+CLIで確認する場合:
 
 まずはAPIに送らず、解析結果とpayloadだけ確認します。
 

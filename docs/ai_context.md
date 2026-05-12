@@ -17,7 +17,7 @@ Git 状態:
 - `main` ブランチを `origin/main` に push 済み。
 - 初回コミット: `60a7ebe Initial CLI batch runner`
 
-現時点では CLI と内部処理を実装済み。次の大きな作業は GUI 化。
+現時点では CLI、内部処理、初期GUIを実装済み。次の作業は GUI の実機運用確認と必要な改善。
 
 主な技術スタック:
 
@@ -25,6 +25,7 @@ Git 状態:
 - Python 標準ライブラリのみ
   - `argparse`
   - `json`
+  - `tkinter`
   - `urllib.request`
   - `unittest`
 - Stable Diffusion WebUI API
@@ -38,6 +39,8 @@ Git 状態:
 python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload.json --dry-run --limit 1
 python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload.json
 python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload_hires.json --limit 1 --batch-count 1
+python -m sd_webui_batch.gui
+.\run_gui.bat
 ```
 
 テスト実行:
@@ -54,18 +57,20 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 
 ## 現在の作業目的
 
-今回の依頼は、今後のセッションや別 AI エージェントへの引き継ぎ用に `/docs/ai_context.md` を作成すること。
+今回の依頼は GUI 化を進めること。
 
 最終的に達成したい状態:
 
-- VSCode 再起動、新規チャット、新規 AI セッション後でも、このファイルを読めばすぐに作業を再開できる。
-- CLI 実装済み部分、設計判断、検証済み事項、未完了の GUI 化タスクが明確になっている。
-- 今後の重要な進捗はこのファイルへ追記される。
+- CLI と同じ内部処理を使うGUIから、プロンプト解析、payload確認、生成実行を行える。
+- GUIで生成枚数 `n_iter` を「生成枚数」として扱い、WebUI Batch Count 相当であることを分かりやすくする。
+- 次回以降はGUIの実運用確認と改善を継続できる。
 
 変更対象の範囲:
 
-- 今回は `/docs/ai_context.md` の新規作成のみ。
-- CLI 本体やテストへの機能変更は不要。
+- `sd_webui_batch/gui.py`
+- `sd_webui_batch/client.py`
+- `README.md`
+- `docs/ai_context.md`
 
 ## これまでに実施した作業
 
@@ -83,6 +88,7 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 - `sd_webui_batch/client.py`
   - Stable Diffusion WebUI API クライアント。
   - `txt2img` 送信、進捗取得、Basic 認証対応。
+  - GUI 用に `/sdapi/v1/interrupt` と `/sdapi/v1/skip` 送信を追加。
 - `sd_webui_batch/cli.py`
   - CLI 本体。
   - `--dry-run` で送信予定 payload を表示し、実際には生成しない。
@@ -95,6 +101,12 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
   - タイトルから `・` を除いた文字列を `override_settings.directories_filename_pattern` に設定する。
   - `save_to_dirs` を有効化する。
   - Hires. fix 有効時、Forge 系 API 互換のため `hr_cfg_scale` / `hr_rescale_cfg` を未指定なら補完する。
+- `sd_webui_batch/gui.py`
+  - `tkinter` ベースのGUI。
+  - `python -m sd_webui_batch.gui` で起動。
+  - プロンプトファイル選択、Payload JSON選択・保存、WebUI URL、生成枚数、Batch Size、基本生成設定、Hires. fix、Checkpoint / VAE / Clip Skip、先頭N件、Dry Run、生成開始、Interrupt / Skip を操作できる。
+  - 長時間生成でUIが固まらないよう、生成処理はバックグラウンドスレッドで実行する。
+  - payload合成は `cli.build_payload` を再利用し、CLIとGUIでルールを分岐させない。
 - `examples/prompts.txt`
   - メモ帳形式サンプル。
 - `examples/payload.json`
@@ -131,30 +143,18 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 
 残っている作業:
 
-- GUI 実装。
-- GUI から以下を編集できるようにする予定。
-  - プロンプトファイル選択
-  - payload JSON 選択・編集
-  - 生成枚数 `n_iter`
-  - Batch Size `batch_size`
-  - Hires. fix 設定
-  - WebUI URL
-  - dry-run / 実行切り替え
-  - 先頭 N 件だけ実行、または全件実行
-  - 実行ログ、エラー表示
-- GUI では `n_iter` という内部名は分かりにくいため、設定欄では「生成枚数」などの説明を付ける。
-- GUI 化時も CLI の内部処理を再利用し、ロジックを二重実装しない。
+- GUI の実機運用確認。
+- ユーザーの実際の生成フローで不足しているGUI項目の洗い出し。
+- GUI からの長時間・大量ジョブ実行時の操作性確認。
+- 実行中の進捗表示を WebUI の `/sdapi/v1/progress` から細かく取るか検討。
+- 生成結果フォルダをGUIから開く導線を追加するか検討。
 
 次に確認すべきこと:
 
-- GUI 技術選定。
-  - 候補: Tkinter, PySide/PyQt, Gradio, Streamlit, Web UI など。
-  - ローカル専用ツールなら依存なしの Tkinter が最小だが、見た目や操作性を重視する場合は別案も検討。
+- 初期GUIは依存を増やさない `tkinter` を採用済み。
 - WebUI API の進捗取得を GUI にどう表示するか。
   - `GET /sdapi/v1/progress?skip_current_image=true` を使う候補。
-- 実行中の停止・スキップ操作を実装するか。
-  - `/sdapi/v1/interrupt`
-  - `/sdapi/v1/skip`
+- `/sdapi/v1/interrupt` と `/sdapi/v1/skip` の送信ボタンは実装済み。実生成中の挙動は追加確認が必要。
 - `payload_json` 編集画面で JSON 構文エラーをどう表示するか。
 - 生成後の保存先を GUI で表示・開けるようにするか。
 
@@ -176,6 +176,9 @@ python -m sd_webui_batch.cli .\examples\prompts.txt --dry-run --limit 1
 python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload.json --dry-run --limit 1
 python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload.json --dry-run --limit 1 --batch-count 3
 python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload_hires.json --dry-run --limit 1
+python -m py_compile sd_webui_batch\gui.py sd_webui_batch\client.py
+python -c "import sd_webui_batch.gui; print('gui import ok')"
+python -c "import tkinter as tk; from sd_webui_batch.gui import BatchRunnerApp; root=tk.Tk(); root.withdraw(); BatchRunnerApp(root); root.destroy(); print('gui instantiate ok')"
 ```
 
 確認できたこと:
@@ -191,10 +194,11 @@ python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\pa
 - `_comment` で始まるキーは送信 payload から削除される。
 - Hires. fix 用 payload に `hr_cfg_scale` / `hr_rescale_cfg` を含めることで、ユーザー環境の Hires HTTP 500 は解消した。
 - ユーザーが `payload_hires.json` での動作確認に成功した。
+- GUIモジュールのimportと非表示ウィンドウでの初期化は確認済み。
 
 まだ確認できていないこと:
 
-- GUI 実装。
+- GUIからの実際の画像生成。
 - 長時間・大量ジョブ実行時の中断、スキップ、再実行。
 - API 認証あり環境での動作。
 - WebUI 起動前や接続失敗時の GUI 表示。
@@ -226,6 +230,8 @@ HTTP 500 from http://127.0.0.1:7860/sdapi/v1/txt2img:
 
 - `README.md`
   - ユーザー向け使い方。
+- `run_gui.bat`
+  - Windows向けGUI起動バッチ。プロジェクトルートへ移動して `python -m sd_webui_batch.gui` を実行する。
 - `.gitignore`
   - Python キャッシュ、仮想環境、ローカル一時ファイルを Git 管理から除外。
 - `docs/ai_context.md`
@@ -238,6 +244,8 @@ HTTP 500 from http://127.0.0.1:7860/sdapi/v1/txt2img:
   - WebUI API 通信。
 - `sd_webui_batch/cli.py`
   - CLI、payload 合成、Hires 互換補完。
+- `sd_webui_batch/gui.py`
+  - GUI本体。
 - `examples/prompts.txt`
   - 動作確認用プロンプトファイル。ユーザーが変更している可能性があるため注意。
 - `examples/payload.json`
@@ -308,3 +316,5 @@ GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`
   - CLI 実装済み内容、Hires. fix の Forge 系互換対応、検証状況、GUI 化前の未完了タスク、Git 操作禁止事項を整理。
   - GitHub リポジトリ URL とプロジェクト名 `sd-webui-batch-runner` を追記。
   - ローカル Git 初期化、初回コミット、`origin` 設定、`main` ブランチの GitHub push を完了。
+  - `tkinter` ベースの初期GUIを追加。`python -m sd_webui_batch.gui` で起動可能。
+  - GUI起動用 `run_gui.bat` を追加。
