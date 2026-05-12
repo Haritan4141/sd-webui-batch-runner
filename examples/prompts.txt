@@ -1,0 +1,40 @@
+・テスト1：ヌルテカ
+__SDXL illustrious/hololive__,
+__hentai studio quality__,
+1girl, 
+arms behind head, armpits, (armpit hair:0.8), 
+(slingshot swimsuit:1.2), areolae, 
+(black pubic hair:1.1), (pubic hair peek:1.2), (excessive pubic hair:1.2),
+pregnant,
+{ | | drink, { | beer mug | wine glass }}, 
+{ street, cityscape, day, daytime | street, cityscape, day, daytime },
+{ | | | from below }, 
+{ drunk, (naughty face:0.9) | blush, giggling | blush | blush, torogao | blush, jitome | blush, blep, tongue out | blush, annoyed },
+masterpiece, best quality, amazing quality,
+
+
+・（テスト2）：ヌルテカ
+<lora:Lono:0.7>, Lono,multicolored hair,pink hair, light blue hair, sharp teeth, multicolored eyes, yellow eyes, purple eyes, hair between eyes, large_breasts, very long low twintails,large hair_ornaments, iono (pokemon) ,
+__hentai studio quality__,
+1girl, 
+arms behind head, armpits, (armpit hair:0.8), 
+(slingshot swimsuit:1.2), areolae, 
+(black pubic hair:1.1), (pubic hair peek:1.2), (excessive pubic hair:1.2),
+pregnant,
+{ | | drink, { | beer mug | wine glass }}, 
+{ street, cityscape, day, daytime | street, cityscape, day, daytime },
+{ | | | from below }, 
+{ drunk, (naughty face:0.9) | blush, giggling | blush | blush, torogao | blush, jitome | blush, blep, tongue out | blush, annoyed },
+masterpiece, best quality, amazing quality,
+
+
+・[テスト3]：ヌルテカ
+__SDXL illustrious/vspo__,
+__SDXL illustrious/hentai studio quality__,
+1girl,student,school_uniform,shirt,neck_ribbon,pleated_skirt,skirt,white_shirt,long_sleeves,collared_shirt,loose_bowtie,knee_socks,loafers,necktie,uniform, { | | school_bag,shoulder_bag }, { | blazer, black_blazer },
+{ | standing }, (skirt lift:1.1),
+pussy, black pubic hair,
+{ classroom,desk | school_gate, outdoors | school_hallway, hallway, corridor },
+{ | | | in the evening, Sunset },
+{ smile | open mouth, smile | embarrassed | blush | blush | blush | drooling, breathing, blush, torogao, open mouth | blush, torogao, open mouth | open mouth, nose blush, tongue out | open mouth, nose blush, tongue out | drunk | drunk | blush, half closed eyes | blush, seductive smile | troubled face | blush, naughty face | blush, giggling | blush, jitome | blush, smug | blush, blep, tongue out | blush, annoyed | blush, awkward | blush, :o },
+masterpiece, best quality, amazing quality,

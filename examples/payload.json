@@ -1,0 +1,11 @@
+{
+  "n_iter": 2,
+  "_comment_n_iter": "生成枚数（Stable Diffusion WebUIのBatch Countに対応）",
+  "batch_size": 1,
+  "steps": 20,
+  "cfg_scale": 5.5,
+  "width": 832,
+  "height": 1216,
+  "sampler_name": "Euler a",
+  "negative_prompt": "bad quality,worst quality,worst detail,sketch,censor,"
+}
