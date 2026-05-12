@@ -12,6 +12,11 @@ GitHub リポジトリ:
 
 - https://github.com/Haritan4141/sd-webui-batch-runner
 
+Git 状態:
+
+- `main` ブランチを `origin/main` に push 済み。
+- 初回コミット: `60a7ebe Initial CLI batch runner`
+
 現時点では CLI と内部処理を実装済み。次の大きな作業は GUI 化。
 
 主な技術スタック:
@@ -156,6 +161,7 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 既知の問題・注意:
 
 - GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`。
+- `main` ブランチは `origin/main` を追跡している。
 - `__pycache__` がテスト実行で生成されることがある。必要がなければ成果物として扱わない。
 - `examples/prompts.txt` はユーザーが動作確認用に書き換えている可能性がある。勝手に上書きしない。
 - `payload.json` / `payload_hires.json` の `n_iter` はユーザーが 1 または 2 などに調整する可能性がある。不要に戻さない。
@@ -301,3 +307,4 @@ GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`
   - 初版作成。
   - CLI 実装済み内容、Hires. fix の Forge 系互換対応、検証状況、GUI 化前の未完了タスク、Git 操作禁止事項を整理。
   - GitHub リポジトリ URL とプロジェクト名 `sd-webui-batch-runner` を追記。
+  - ローカル Git 初期化、初回コミット、`origin` 設定、`main` ブランチの GitHub push を完了。
