@@ -57,13 +57,16 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 
 ## 現在の作業目的
 
-今回の依頼は GUI 化を進めること。
+今回の依頼は、大量生成を安全に分割し、GUIで進捗を明確に表示すること。
 
 最終的に達成したい状態:
 
 - CLI と同じ内部処理を使うGUIから、プロンプト解析、payload確認、生成実行を行える。
 - GUIで生成枚数 `n_iter` を「生成枚数」として扱い、WebUI Batch Count 相当であることを分かりやすくする。
 - 次回以降はGUIの実運用確認と改善を継続できる。
+- 1リクエスト最大100画像へ自動分割し、6000枚などの総生成数を維持する。
+- runner実行時はForgeのグリッド生成を必ず無効化する。
+- GUIでジョブ、送信、確定完了枚数、WebUI進捗、現在送信ETAを表示する。
 
 変更対象の範囲:
 
@@ -89,6 +92,11 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
   - Stable Diffusion WebUI API クライアント。
   - `txt2img` 送信、進捗取得、Basic 認証対応。
   - GUI 用に `/sdapi/v1/interrupt` と `/sdapi/v1/skip` 送信を追加。
+  - タイムアウト・接続切断を「サーバ処理状態が不明な通信エラー」として区別する。
+- `sd_webui_batch/batching.py`
+  - `n_iter × batch_size` を基準に、1リクエスト最大100画像へ分割する。
+  - 固定Seed/SubseedをWebUIの規則に合わせてチャンク境界で補正する。
+  - `-1` / 未指定のSeed/Subseedは論理ジョブごとに一度だけ解決し、単一リクエスト時と同じ連番を維持する。
 - `sd_webui_batch/cli.py`
   - CLI 本体。
   - `--dry-run` で送信予定 payload を表示し、実際には生成しない。
@@ -101,12 +109,18 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
   - タイトルから `・` を除いた文字列を `override_settings.directories_filename_pattern` に設定する。
   - `save_to_dirs` を有効化する。
   - Hires. fix 有効時、Forge 系 API 互換のため `hr_cfg_scale` / `hr_rescale_cfg` を未指定なら補完する。
+  - `return_grid=false` と `grid_save=false` を全リクエストで強制する。
+  - CLIは `--chunk-size`（1〜100、既定100）とチャンク単位の進捗表示に対応する。
 - `sd_webui_batch/gui.py`
   - `tkinter` ベースのGUI。
   - `python -m sd_webui_batch.gui` で起動。
   - プロンプトファイル選択、Payload JSON選択・保存、WebUI URL、生成枚数、Batch Size、基本生成設定、Hires. fix、Checkpoint / VAE / Clip Skip、先頭N件、Dry Run、生成開始、Interrupt / Skip を操作できる。
   - 長時間生成でUIが固まらないよう、生成処理はバックグラウンドスレッドで実行する。
   - payload合成は `cli.build_payload` を再利用し、CLIとGUIでルールを分岐させない。
+  - 全画像数基準の進捗バーと、ジョブ番号・送信番号・確定完了枚数・WebUI進捗・現在送信ETAを表示する。
+  - 「停止」は現在の最大100枚送信後に停止し、Interrupt時は後続送信を開始しない。
+  - Skipした送信は保存枚数を確定できないため確定枚数へ加算せず、保存枚数不明として後続送信を続ける。
+  - Interrupt / Skipの制御API完了までは次のrunを開始させない。
 - `examples/prompts.txt`
   - メモ帳形式サンプル。
 - `examples/payload.json`
@@ -119,6 +133,12 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
   - 可変プロンプト開始行、タイトル分割、`~~~~~~` の通常文字列扱い、サブディレクトリ名サニタイズを検証。
 - `tests/test_cli.py`
   - `n_iter` の優先順位、デフォルト、`_comment` キー削除、Hires 互換デフォルトを検証。
+- `tests/test_batching.py`
+  - 6000枚の60分割、端数、Batch Size、固定Seed、Variation Seed、非破壊コピーを検証。
+- `tests/test_client.py`
+  - 直接Timeout、URLError内Timeout、接続切断の正規化を検証。
+- `tests/test_gui_helpers.py` / `tests/test_gui_runner.py`
+  - 進捗表示、チャンク実行、HTTPエラー後の次ジョブ継続、通信断時の全体停止を検証。
 - `README.md`
   - CLI の使い方、メモ帳形式、Hires. fix 設定、`n_iter` の意味を記載。
 
@@ -146,14 +166,13 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 - GUI の実機運用確認。
 - ユーザーの実際の生成フローで不足しているGUI項目の洗い出し。
 - GUI からの長時間・大量ジョブ実行時の操作性確認。
-- 実行中の進捗表示を WebUI の `/sdapi/v1/progress` から細かく取るか検討。
+- 実機で `/sdapi/v1/progress` の進捗率・ETA表示を確認する。
 - 生成結果フォルダをGUIから開く導線を追加するか検討。
 
 次に確認すべきこと:
 
 - 初期GUIは依存を増やさない `tkinter` を採用済み。
-- WebUI API の進捗取得を GUI にどう表示するか。
-  - `GET /sdapi/v1/progress?skip_current_image=true` を使う候補。
+- WebUI API の進捗取得は `GET /sdapi/v1/progress?skip_current_image=true` を1秒間隔で使用する。
 - `/sdapi/v1/interrupt` と `/sdapi/v1/skip` の送信ボタンは実装済み。実生成中の挙動は追加確認が必要。
 - `payload_json` 編集画面で JSON 構文エラーをどう表示するか。
 - 生成後の保存先を GUI で表示・開けるようにするか。
@@ -242,6 +261,8 @@ HTTP 500 from http://127.0.0.1:7860/sdapi/v1/txt2img:
   - メモ帳形式の解析ロジック。
 - `sd_webui_batch/client.py`
   - WebUI API 通信。
+- `sd_webui_batch/batching.py`
+  - 大量生成payloadの100画像単位分割とSeed補正。
 - `sd_webui_batch/cli.py`
   - CLI、payload 合成、Hires 互換補完。
 - `sd_webui_batch/gui.py`

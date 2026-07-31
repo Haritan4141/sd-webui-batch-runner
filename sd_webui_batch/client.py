@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import base64
+from http.client import HTTPException
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -11,6 +12,18 @@ from urllib.request import Request, urlopen
 
 class SdWebuiApiError(RuntimeError):
     """Raised when Stable Diffusion WebUI API returns an error."""
+
+
+class SdWebuiTransportError(SdWebuiApiError):
+    """Raised when a request ends without a definite HTTP response.
+
+    The WebUI may still be processing the request, so callers must not retry
+    automatically or start a later generation request.
+    """
+
+
+class SdWebuiTimeoutError(SdWebuiTransportError):
+    """Raised when communication with Stable Diffusion WebUI times out."""
 
 
 @dataclass
@@ -62,7 +75,13 @@ class SdWebuiClient:
             detail = error.read().decode("utf-8", errors="replace")
             raise SdWebuiApiError(f"HTTP {error.code} from {url}: {detail}") from error
         except URLError as error:
-            raise SdWebuiApiError(f"Could not connect to {url}: {error.reason}") from error
+            if isinstance(error.reason, TimeoutError):
+                raise SdWebuiTimeoutError(f"Timed out while waiting for {url}") from error
+            raise SdWebuiTransportError(f"Connection to {url} failed: {error.reason}") from error
+        except TimeoutError as error:
+            raise SdWebuiTimeoutError(f"Timed out while waiting for {url}") from error
+        except (ConnectionError, HTTPException, OSError) as error:
+            raise SdWebuiTransportError(f"Connection to {url} was interrupted: {error}") from error
 
         if not raw:
             return {}

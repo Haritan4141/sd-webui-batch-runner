@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import queue
 from types import SimpleNamespace
@@ -9,12 +10,18 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any
 
+from .batching import (
+    DEFAULT_MAX_IMAGES_PER_REQUEST,
+    BatchChunk,
+    split_payload_into_chunks,
+)
 from .cli import build_payload, strip_comment_fields
-from .client import SdWebuiApiError, SdWebuiClient
+from .client import SdWebuiApiError, SdWebuiClient, SdWebuiTransportError
 from .parser import PromptJob, PromptParseError, parse_prompt_note, read_text_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROGRESS_POLL_INTERVAL_SECONDS = 1.0
 
 
 class BatchRunnerApp:
@@ -28,7 +35,16 @@ class BatchRunnerApp:
         self.jobs: list[PromptJob] = []
         self.worker: threading.Thread | None = None
         self.stop_after_current = threading.Event()
+        self.interrupt_requested = threading.Event()
+        self.skip_requested = threading.Event()
+        self.control_in_flight = threading.Event()
+        self.control_finished = threading.Event()
+        self.control_finished.set()
+        self.progress_poll_warning_sent = threading.Event()
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.active_run_id = 0
+        self.generation_running = False
+        self.webui_controls_enabled = False
 
         self.prompt_path_var = tk.StringVar(value=str(PROJECT_ROOT / "examples" / "prompts.txt"))
         self.payload_path_var = tk.StringVar(value=str(PROJECT_ROOT / "examples" / "payload.json"))
@@ -72,6 +88,7 @@ class BatchRunnerApp:
 
         self._build_ui()
         self.n_iter_var.trace_add("write", lambda *_: self._update_job_tree(self.jobs))
+        self.batch_size_var.trace_add("write", lambda *_: self._update_job_tree(self.jobs))
         self.sanitize_subdir_var.trace_add("write", lambda *_: self._update_job_tree(self.jobs))
         self._load_payload_if_present()
         self.refresh_jobs(show_errors=False)
@@ -144,6 +161,10 @@ class BatchRunnerApp:
 
         ttk.Checkbutton(frame, text="サブディレクトリ名をWindows向けに整形", variable=self.sanitize_subdir_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=5)
         ttk.Checkbutton(frame, text="エラーで停止", variable=self.stop_on_error_var).grid(row=3, column=3, columnspan=2, sticky="w", padx=8)
+        ttk.Label(
+            frame,
+            text=f"自動分割: 1送信あたり最大{DEFAULT_MAX_IMAGES_PER_REQUEST}枚 / グリッド生成なし",
+        ).grid(row=3, column=5, columnspan=3, sticky="w", padx=8)
 
         ttk.Label(frame, text="Negative Prompt").grid(row=4, column=0, sticky="nw", padx=8, pady=(6, 4))
         self.negative_prompt_text = tk.Text(frame, height=3, wrap="word", undo=True)
@@ -179,11 +200,26 @@ class BatchRunnerApp:
         self.preview_button.grid(row=0, column=0, padx=(0, 6))
         self.start_button = ttk.Button(frame, text="生成開始", command=self.start_generation)
         self.start_button.grid(row=0, column=1, padx=6)
-        self.stop_button = ttk.Button(frame, text="現在のジョブ後に停止", command=self.request_stop, state="disabled")
+        self.stop_button = ttk.Button(
+            frame,
+            text=f"現在の{DEFAULT_MAX_IMAGES_PER_REQUEST}枚送信後に停止",
+            command=self.request_stop,
+            state="disabled",
+        )
         self.stop_button.grid(row=0, column=2, padx=6)
-        self.interrupt_button = ttk.Button(frame, text="WebUI Interrupt", command=self.interrupt_webui)
+        self.interrupt_button = ttk.Button(
+            frame,
+            text="WebUI Interrupt",
+            command=self.interrupt_webui,
+            state="disabled",
+        )
         self.interrupt_button.grid(row=0, column=3, padx=6)
-        self.skip_button = ttk.Button(frame, text="WebUI Skip", command=self.skip_webui)
+        self.skip_button = ttk.Button(
+            frame,
+            text="WebUI Skip",
+            command=self.skip_webui,
+            state="disabled",
+        )
         self.skip_button.grid(row=0, column=4, padx=6)
 
         ttk.Label(frame, textvariable=self.status_var).grid(row=0, column=6, sticky="e")
@@ -195,16 +231,18 @@ class BatchRunnerApp:
         frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         frame.columnconfigure(0, weight=1)
 
-        columns = ("index", "title", "images", "subdir")
+        columns = ("index", "title", "images", "requests", "subdir")
         self.job_tree = ttk.Treeview(frame, columns=columns, show="headings", height=7)
         self.job_tree.heading("index", text="#")
         self.job_tree.heading("title", text="タイトル")
-        self.job_tree.heading("images", text="生成枚数")
+        self.job_tree.heading("images", text="総画像数")
+        self.job_tree.heading("requests", text="送信回数")
         self.job_tree.heading("subdir", text="Subdirectory override")
         self.job_tree.column("index", width=50, anchor="center", stretch=False)
         self.job_tree.column("title", width=320)
         self.job_tree.column("images", width=90, anchor="center", stretch=False)
-        self.job_tree.column("subdir", width=420)
+        self.job_tree.column("requests", width=80, anchor="center", stretch=False)
+        self.job_tree.column("subdir", width=340)
         self.job_tree.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
 
     def _build_log_section(self, parent: ttk.Frame) -> None:
@@ -317,10 +355,27 @@ class BatchRunnerApp:
             self.job_tree.delete(item)
 
         n_iter = self._safe_int(self.n_iter_var.get(), default=1)
+        batch_size = self._safe_int(self.batch_size_var.get(), default=1)
+        try:
+            chunks = split_payload_into_chunks(
+                {"n_iter": n_iter, "batch_size": batch_size},
+                max_images_per_request=DEFAULT_MAX_IMAGES_PER_REQUEST,
+                resolve_random_seeds=False,
+            )
+        except ValueError:
+            total_images: int | str = "-"
+            request_count: int | str = "-"
+        else:
+            total_images = chunks[0].total_images
+            request_count = len(chunks)
         sanitize = self.sanitize_subdir_var.get()
         for job in jobs:
             subdir = job.subdirectory if not sanitize else self._sanitize_preview(job.subdirectory)
-            self.job_tree.insert("", "end", values=(job.index, job.title, n_iter, subdir))
+            self.job_tree.insert(
+                "",
+                "end",
+                values=(job.index, job.title, total_images, request_count, subdir),
+            )
 
     def _populate_form(self, payload: dict[str, Any]) -> None:
         self.n_iter_var.set(str(payload.get("n_iter", 1)))
@@ -425,6 +480,13 @@ class BatchRunnerApp:
         self._start_worker(dry_run=False)
 
     def _start_worker(self, dry_run: bool) -> None:
+        if self.control_in_flight.is_set():
+            messagebox.showinfo(
+                "WebUI制御中",
+                "Interrupt / Skip の送信完了を待ってから再実行してください。",
+            )
+            return
+
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("実行中", "すでに実行中です。")
             return
@@ -433,6 +495,16 @@ class BatchRunnerApp:
             jobs = self._selected_jobs()
             base_payload = self._collect_base_payload()
             args = self._build_cli_args()
+            job_plans = [
+                (
+                    job,
+                    split_payload_into_chunks(
+                        build_payload(job, args, base_payload),
+                        max_images_per_request=DEFAULT_MAX_IMAGES_PER_REQUEST,
+                    ),
+                )
+                for job in jobs
+            ]
             timeout = self._parse_timeout()
             client_options = {
                 "base_url": self.url_var.get().strip(),
@@ -446,79 +518,401 @@ class BatchRunnerApp:
             return
 
         self.stop_after_current.clear()
-        self.progress.configure(maximum=max(len(jobs), 1), value=0)
+        self.interrupt_requested.clear()
+        self.skip_requested.clear()
+        self.progress_poll_warning_sent.clear()
+        self.active_run_id += 1
+        run_id = self.active_run_id
+        total_images = sum(chunk.image_count for _, chunks in job_plans for chunk in chunks)
+        total_requests = sum(len(chunks) for _, chunks in job_plans)
+        self.progress.configure(maximum=max(total_images, 1), value=0)
+        self.status_var.set("準備中")
+        self.webui_controls_enabled = not dry_run
         self._set_running(True)
         self._clear_log()
         mode = "dry-run" if dry_run else "generation"
-        self._append_log(f"Starting {mode}: {len(jobs)} job(s)")
+        self._append_log(
+            f"Starting {mode}: {len(jobs)} job(s), {total_images} image(s), "
+            f"{total_requests} request(s)"
+        )
+        self._append_log(
+            f"Each request is limited to {DEFAULT_MAX_IMAGES_PER_REQUEST} image(s); "
+            "grid creation is disabled."
+        )
 
         self.worker = threading.Thread(
             target=self._run_jobs,
-            args=(jobs, base_payload, args, client_options, stop_on_error, dry_run),
+            args=(run_id, job_plans, client_options, stop_on_error, dry_run),
             daemon=True,
         )
         self.worker.start()
 
     def _run_jobs(
         self,
-        jobs: list[PromptJob],
-        base_payload: dict[str, Any],
-        args: SimpleNamespace,
+        run_id: int,
+        job_plans: list[tuple[PromptJob, tuple[BatchChunk, ...]]],
         client_options: dict[str, Any],
         stop_on_error: bool,
         dry_run: bool,
     ) -> None:
         client = SdWebuiClient(**client_options)
+        progress_client = SdWebuiClient(**{**client_options, "timeout": 5})
         failures = 0
+        skipped_requests = 0
+        confirmed_images = 0
+        total_images = sum(chunk.image_count for _, chunks in job_plans for chunk in chunks)
+        outcome = "completed"
+        abort_run = False
+        partial_images_possible = False
 
         try:
-            for number, job in enumerate(jobs, start=1):
-                payload = build_payload(job, args, base_payload)
-                subdir = payload["override_settings"]["directories_filename_pattern"]
-                self.events.put(("log", f"\n{number}/{len(jobs)}: {job.title}"))
+            for number, (job, chunks) in enumerate(job_plans, start=1):
+                subdir = chunks[0].payload["override_settings"]["directories_filename_pattern"]
+                self.events.put(("log", f"\nJob {number}/{len(job_plans)}: {job.title}"))
                 self.events.put(("log", f"subdirectory: {subdir}"))
+                self.events.put(
+                    (
+                        "log",
+                        f"{chunks[0].total_images} image(s) in {len(chunks)} request(s)",
+                    )
+                )
 
                 if dry_run:
-                    self.events.put(("log", json.dumps(payload, ensure_ascii=False, indent=2)))
-                else:
+                    for chunk in chunks:
+                        self.events.put(
+                            (
+                                "log",
+                                f"request {chunk.ordinal}/{chunk.total_chunks}: images "
+                                f"{chunk.image_start}-{chunk.image_end}/{chunk.total_images}, "
+                                f"n_iter={chunk.payload['n_iter']}, "
+                                f"seed={chunk.payload.get('seed', 'default')}",
+                            )
+                        )
+                    self.events.put(("log", "first request payload:"))
+                    self.events.put(
+                        ("log", json.dumps(chunks[0].payload, ensure_ascii=False, indent=2))
+                    )
+                    confirmed_images += chunks[0].total_images
+                    self._put_run_progress(
+                        run_id,
+                        number,
+                        len(job_plans),
+                        chunks[-1],
+                        confirmed_images,
+                        total_images,
+                        phase="dry_run",
+                    )
+                    continue
+
+                for chunk in chunks:
+                    if self.stop_after_current.is_set():
+                        outcome = "stopped"
+                        abort_run = True
+                        break
+
+                    self.events.put(
+                        (
+                            "log",
+                            f"request {chunk.ordinal}/{chunk.total_chunks}: sending images "
+                            f"{chunk.image_start}-{chunk.image_end}/{chunk.total_images}",
+                        )
+                    )
+                    self._put_run_progress(
+                        run_id,
+                        number,
+                        len(job_plans),
+                        chunk,
+                        confirmed_images,
+                        total_images,
+                        phase="started",
+                    )
+
+                    poll_stop = threading.Event()
+                    progress_context = {
+                        "run_id": run_id,
+                        "job_number": number,
+                        "job_total": len(job_plans),
+                        "chunk_number": chunk.ordinal,
+                        "chunk_total": chunk.total_chunks,
+                        "chunk_image_count": chunk.image_count,
+                        "confirmed_images": confirmed_images,
+                        "total_images": total_images,
+                    }
+                    poller = threading.Thread(
+                        target=self._poll_progress,
+                        args=(progress_client, poll_stop, progress_context),
+                        daemon=True,
+                    )
+                    poller.start()
+                    request_failed = False
+
                     try:
-                        client.txt2img(payload)
+                        client.txt2img(chunk.payload)
+                    except SdWebuiTransportError as error:
+                        failures += 1
+                        abort_run = True
+                        if self.interrupt_requested.is_set():
+                            outcome = "stopped"
+                            partial_images_possible = True
+                            self.events.put(
+                                (
+                                    "log",
+                                    "Interrupted. The current request may contain partially "
+                                    "saved images.",
+                                )
+                            )
+                        else:
+                            outcome = "failed"
+                            self.events.put(("log", f"connection state unknown: {error}"))
+                            self.events.put(
+                                (
+                                    "log",
+                                    "Stopping all jobs because WebUI may still be processing "
+                                    "this request. It will not be retried automatically.",
+                                )
+                            )
                     except SdWebuiApiError as error:
                         failures += 1
-                        self.events.put(("log", f"failed: {error}"))
-                        if stop_on_error:
-                            break
+                        request_failed = True
+                        self.events.put(("log", f"request failed: {error}"))
+                        self.events.put(
+                            (
+                                "log",
+                                "Skipping the remaining requests for this job; the failed "
+                                "request will not be retried automatically.",
+                            )
+                        )
+                        if self.interrupt_requested.is_set():
+                            outcome = "stopped"
+                            partial_images_possible = True
+                            abort_run = True
+                        elif stop_on_error:
+                            outcome = "failed"
+                            abort_run = True
+                    except Exception as error:
+                        failures += 1
+                        outcome = "failed"
+                        abort_run = True
+                        self.events.put(("log", f"unexpected error: {error}"))
                     else:
-                        self.events.put(("log", "completed"))
+                        poll_stop.set()
+                        poller.join(timeout=6)
+                        if self.interrupt_requested.is_set():
+                            outcome = "stopped"
+                            partial_images_possible = True
+                            abort_run = True
+                            self.events.put(
+                                (
+                                    "log",
+                                    "Interrupted. The current request may contain partially "
+                                    "saved images and is not counted as confirmed.",
+                                )
+                            )
+                        elif self.skip_requested.is_set():
+                            skipped_requests += 1
+                            self.events.put(
+                                (
+                                    "log",
+                                    f"request {chunk.ordinal}/{chunk.total_chunks} was "
+                                    "skipped; WebUI may have saved some images, but the "
+                                    "exact count is unknown. This request is not added to "
+                                    "the confirmed total.",
+                                )
+                            )
+                            self._put_run_progress(
+                                run_id,
+                                number,
+                                len(job_plans),
+                                chunk,
+                                confirmed_images,
+                                total_images,
+                                phase="skipped",
+                            )
+                        else:
+                            confirmed_images += chunk.image_count
+                            percent = chunk.image_end / chunk.total_images * 100
+                            self.events.put(
+                                (
+                                    "log",
+                                    f"completed through image {chunk.image_end}/"
+                                    f"{chunk.total_images} ({percent:.1f}%)",
+                                )
+                            )
+                            self._put_run_progress(
+                                run_id,
+                                number,
+                                len(job_plans),
+                                chunk,
+                                confirmed_images,
+                                total_images,
+                                phase="completed",
+                            )
+                    finally:
+                        poll_stop.set()
+                        poller.join(timeout=6)
 
-                self.events.put(("progress", number))
-                if self.stop_after_current.is_set():
-                    self.events.put(("log", "stop requested; stopping after current job"))
+                    if not self.control_finished.is_set():
+                        self.events.put(
+                            (
+                                "log",
+                                "waiting for WebUI Interrupt / Skip control request to finish",
+                            )
+                        )
+                        self.control_finished.wait()
+                    self.skip_requested.clear()
+
+                    if abort_run:
+                        break
+
+                    if request_failed:
+                        # Preserve the old behavior: a failed API request skips the
+                        # rest of this logical prompt and proceeds to the next one.
+                        break
+
+                    if self.stop_after_current.is_set():
+                        outcome = "stopped"
+                        abort_run = True
+                        self.events.put(("log", "stop requested; stopping after current request"))
+                        break
+
+                if abort_run:
                     break
+        except Exception as error:
+            failures += 1
+            outcome = "failed"
+            self.events.put(("log", f"worker failed unexpectedly: {error}"))
         finally:
-            self.events.put(("done", failures))
+            self.skip_requested.clear()
+            if outcome == "completed":
+                if failures and skipped_requests:
+                    outcome = "completed_with_errors_and_skips"
+                elif failures:
+                    outcome = "completed_with_errors"
+                elif skipped_requests:
+                    outcome = "completed_with_skips"
+            self.events.put(
+                (
+                    "done",
+                    {
+                        "run_id": run_id,
+                        "outcome": outcome,
+                        "failures": failures,
+                        "skipped_requests": skipped_requests,
+                        "confirmed_images": confirmed_images,
+                        "total_images": total_images,
+                        "dry_run": dry_run,
+                        "partial_images_possible": partial_images_possible,
+                    },
+                )
+            )
+
+    def _put_run_progress(
+        self,
+        run_id: int,
+        job_number: int,
+        job_total: int,
+        chunk: BatchChunk,
+        confirmed_images: int,
+        total_images: int,
+        *,
+        phase: str,
+    ) -> None:
+        self.events.put(
+            (
+                "run_progress",
+                {
+                    "run_id": run_id,
+                    "phase": phase,
+                    "job_number": job_number,
+                    "job_total": job_total,
+                    "chunk_number": chunk.ordinal,
+                    "chunk_total": chunk.total_chunks,
+                    "chunk_image_count": chunk.image_count,
+                    "confirmed_images": confirmed_images,
+                    "total_images": total_images,
+                    "webui_progress": None,
+                    "eta_relative": None,
+                },
+            )
+        )
+
+    def _poll_progress(
+        self,
+        client: SdWebuiClient,
+        stop_event: threading.Event,
+        context: dict[str, Any],
+    ) -> None:
+        maximum_progress = 0.0
+
+        while not stop_event.wait(PROGRESS_POLL_INTERVAL_SECONDS):
+            try:
+                progress_data = client.get_progress(skip_current_image=True)
+            except Exception as error:
+                if stop_event.is_set():
+                    break
+                if not self.progress_poll_warning_sent.is_set():
+                    self.progress_poll_warning_sent.set()
+                    self.events.put(
+                        (
+                            "log",
+                            f"progress polling unavailable; generation continues: {error}",
+                        )
+                    )
+                continue
+
+            if stop_event.is_set():
+                break
+            progress = normalize_webui_progress(progress_data.get("progress"))
+            if progress is None:
+                continue
+            maximum_progress = max(maximum_progress, progress)
+            value = dict(context)
+            value.update(
+                {
+                    "phase": "polling",
+                    "webui_progress": maximum_progress,
+                    "eta_relative": normalize_eta(progress_data.get("eta_relative")),
+                }
+            )
+            self.events.put(("run_progress", value))
 
     def request_stop(self) -> None:
         self.stop_after_current.set()
-        self._append_log("Stop requested. 現在のジョブ完了後に停止します。")
+        self._append_log("Stop requested. 現在の送信完了後に停止します。")
 
     def interrupt_webui(self) -> None:
+        if not self._control_is_available():
+            return
+        self.interrupt_requested.set()
+        self.stop_after_current.set()
+        self._append_log("Interrupt requested. 後続の送信は開始しません。")
         self._post_control("interrupt")
 
     def skip_webui(self) -> None:
+        if not self._control_is_available():
+            return
+        self.skip_requested.set()
+        self._append_log("Skip requested. この送信の保存枚数は確定数に含めません。")
         self._post_control("skip")
 
     def _post_control(self, action: str) -> None:
+        if not self._control_is_available():
+            return
+
         try:
             client_options = {
                 "base_url": self.url_var.get().strip(),
-                "timeout": self._parse_timeout(),
+                "timeout": 10,
                 "username": self.username_var.get().strip() or None,
                 "password": self.password_var.get() or None,
             }
         except ValueError as error:
             messagebox.showerror("設定エラー", str(error))
             return
+
+        self.control_in_flight.set()
+        self.control_finished.clear()
+        self._refresh_action_states()
 
         def worker() -> None:
             try:
@@ -531,8 +925,18 @@ class BatchRunnerApp:
                 self.events.put(("log", f"{action} failed: {error}"))
             else:
                 self.events.put(("log", f"{action} sent"))
+            finally:
+                self.control_finished.set()
+                self.events.put(("control_done", {"action": action}))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _control_is_available(self) -> bool:
+        return (
+            self.generation_running
+            and self.webui_controls_enabled
+            and not self.control_in_flight.is_set()
+        )
 
     def _drain_events(self) -> None:
         try:
@@ -540,25 +944,99 @@ class BatchRunnerApp:
                 event, value = self.events.get_nowait()
                 if event == "log":
                     self._append_log(str(value))
-                elif event == "progress":
-                    self.progress.configure(value=value)
-                    self.status_var.set(f"進行中: {value}/{int(self.progress['maximum'])}")
+                elif event == "control_done":
+                    self.control_in_flight.clear()
+                    self._refresh_action_states()
+                elif event == "run_progress":
+                    progress_data = dict(value)
+                    if progress_data.get("run_id") != self.active_run_id:
+                        continue
+                    confirmed = int(progress_data["confirmed_images"])
+                    current = normalize_webui_progress(progress_data.get("webui_progress"))
+                    estimated = confirmed
+                    if current is not None:
+                        estimated += current * int(progress_data["chunk_image_count"])
+                    self.progress.configure(value=min(estimated, int(progress_data["total_images"])))
+                    self.status_var.set(format_progress_status(progress_data))
                 elif event == "done":
-                    failures = int(value)
+                    done_data = dict(value)
+                    if done_data.get("run_id") != self.active_run_id:
+                        continue
+                    failures = int(done_data["failures"])
+                    outcome = str(done_data["outcome"])
+                    skipped_requests = int(done_data.get("skipped_requests", 0))
+                    confirmed = int(done_data["confirmed_images"])
+                    total = int(done_data["total_images"])
                     self._set_running(False)
-                    self.status_var.set("完了" if failures == 0 else f"完了: {failures} failure(s)")
-                    self._append_log("\nAll jobs completed." if failures == 0 else f"\nCompleted with {failures} failure(s).")
+                    if done_data.get("dry_run"):
+                        self.progress.configure(value=total)
+                        self.status_var.set(f"Dry Run完了: {total}枚 / 送信なし")
+                        self._append_log("\nDry Run completed. No API requests were sent.")
+                    elif outcome == "completed":
+                        self.progress.configure(value=total)
+                        self.status_var.set(f"完了: {confirmed}/{total}枚")
+                        self._append_log("\nAll jobs completed.")
+                    elif outcome == "completed_with_errors":
+                        self.progress.configure(value=confirmed)
+                        self.status_var.set(f"エラーあり: 確定 {confirmed}/{total}枚")
+                        self._append_log(f"\nCompleted with {failures} failure(s).")
+                    elif outcome == "completed_with_skips":
+                        self.progress.configure(value=confirmed)
+                        self.status_var.set(f"スキップあり: 確定 {confirmed}/{total}枚")
+                        self._append_log(
+                            f"\nCompleted with {skipped_requests} skipped request(s). "
+                            "Skipped requests may contain saved images whose exact count "
+                            "is unknown."
+                        )
+                    elif outcome == "completed_with_errors_and_skips":
+                        self.progress.configure(value=confirmed)
+                        self.status_var.set(f"エラー・スキップあり: 確定 {confirmed}/{total}枚")
+                        self._append_log(
+                            f"\nCompleted with {failures} failure(s) and "
+                            f"{skipped_requests} skipped request(s). Skipped requests may "
+                            "contain saved images whose exact count is unknown."
+                        )
+                    elif outcome == "stopped":
+                        self.progress.configure(value=confirmed)
+                        self.status_var.set(f"停止: 確定 {confirmed}/{total}枚")
+                        if done_data.get("partial_images_possible"):
+                            self._append_log(
+                                "\nStopped. The interrupted request may contain partially saved images."
+                            )
+                        else:
+                            self._append_log("\nStopped after the current request completed.")
+                    else:
+                        self.progress.configure(value=confirmed)
+                        self.status_var.set(f"異常停止: 確定 {confirmed}/{total}枚")
+                        self._append_log(f"\nStopped after {failures} failure(s).")
         except queue.Empty:
             pass
 
         self.root.after(100, self._drain_events)
 
     def _set_running(self, running: bool) -> None:
-        self.start_button.configure(state="disabled" if running else "normal")
-        self.preview_button.configure(state="disabled" if running else "normal")
-        self.stop_button.configure(state="normal" if running else "disabled")
+        self.generation_running = running
+        if not running:
+            self.webui_controls_enabled = False
+        self._refresh_action_states()
         if not running:
             self.stop_after_current.clear()
+            self.interrupt_requested.clear()
+            self.skip_requested.clear()
+
+    def _refresh_action_states(self) -> None:
+        control_pending = self.control_in_flight.is_set()
+        run_actions_enabled = self.generation_running and not control_pending
+        webui_control_enabled = run_actions_enabled and self.webui_controls_enabled
+        start_enabled = not self.generation_running and not control_pending
+
+        self.start_button.configure(state="normal" if start_enabled else "disabled")
+        self.preview_button.configure(state="normal" if start_enabled else "disabled")
+        self.stop_button.configure(state="normal" if run_actions_enabled else "disabled")
+        self.interrupt_button.configure(
+            state="normal" if webui_control_enabled else "disabled"
+        )
+        self.skip_button.configure(state="normal" if webui_control_enabled else "disabled")
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
@@ -576,6 +1054,8 @@ class BatchRunnerApp:
         if not value:
             return 86400
         parsed = float(value)
+        if parsed < 0:
+            raise ValueError("Timeout must be 0 (no timeout) or a positive number.")
         return None if parsed == 0 else parsed
 
     def _set_int(self, payload: dict[str, Any], key: str, value: str, *, required: bool, default: int) -> None:
@@ -630,6 +1110,62 @@ class BatchRunnerApp:
         from .cli import sanitize_subdirectory
 
         return sanitize_subdirectory(value)
+
+
+def normalize_webui_progress(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return min(max(parsed, 0.0), 1.0)
+
+
+def normalize_eta(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+def format_eta(seconds: Any) -> str | None:
+    parsed = normalize_eta(seconds)
+    if parsed is None:
+        return None
+    total_seconds = int(round(parsed))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds_part:02d}"
+
+
+def format_progress_status(data: dict[str, Any]) -> str:
+    base = (
+        f"ジョブ {data['job_number']}/{data['job_total']}｜"
+        f"送信 {data['chunk_number']}/{data['chunk_total']}｜"
+        f"確定 {data['confirmed_images']}/{data['total_images']}枚"
+    )
+    if data.get("phase") == "dry_run":
+        return "Dry Run｜" + base
+    if data.get("phase") == "skipped":
+        return base + "｜スキップ（保存枚数不明）"
+
+    progress = normalize_webui_progress(data.get("webui_progress"))
+    if progress is None:
+        return base + ("｜送信完了" if data.get("phase") == "completed" else "｜開始中")
+
+    status = f"{base}｜WebUI {progress * 100:.1f}%"
+    eta = format_eta(data.get("eta_relative"))
+    if eta is not None:
+        status += f"｜現送信ETA {eta}"
+    return status
 
 
 class ToolTip:

@@ -38,6 +38,8 @@ Windowsでは `run_gui.bat` をダブルクリックして起動することも�
 
 GUIでは、プロンプトファイル、Payload JSON、WebUI URL、生成枚数、Batch Size、基本生成設定、Hires. fix、Checkpoint / VAE / Clip Skip、先頭N件だけ実行、Dry Run、生成開始、WebUI Interrupt / Skipを操作できます。
 
+大量生成は1回のAPIリクエストへ最大100枚ずつ自動分割します。たとえば生成枚数6000、Batch Size 1なら100枚×60回です。GUIにはジョブ番号、送信番号、確定完了枚数、WebUIの現在進捗、現在送信のETAを表示します。
+
 `Dry Run` は画像生成せず、WebUIへ送る予定のpayloadをログに表示します。
 `Payload JSON` の `保存` は、GUI上の設定をJSONファイルへ書き戻します。
 
@@ -84,10 +86,33 @@ python -m sd_webui_batch.cli .\examples\prompts.txt --limit 1 --batch-count 2
 - `send_images`: デフォルトfalse
 - `override_settings.save_to_dirs`: true
 - `override_settings.directories_filename_pattern`: `・` を除いたタイトル
+- `override_settings.return_grid`: 常にfalse
+- `override_settings.grid_save`: 常にfalse
 
 サブディレクトリ名はWindowsで使えない文字だけ `_` に置換します。完全にタイトルをそのまま使いたい場合は `--no-sanitize-subdir` を付けてください。
 
 JSONには標準のコメント構文がないため、説明は `_comment_n_iter` のようなキーで書きます。`_comment` で始まるキーはWebUIへ送信する前に削除されます。
+
+## 大量生成・自動分割・グリッド無効化
+
+`n_iter × batch_size` が100枚を超える場合、ランナーが複数の `txt2img` リクエストへ自動分割します。GUIの生成枚数やpayloadの `n_iter` は総Batch Countのままなので、6000から100へ書き換える必要はありません。
+
+- GUI: 1リクエスト最大100枚で固定
+- CLI: 既定100枚。`--chunk-size` で1〜100枚の範囲に調整可能（100枚を超える指定は拒否）
+- 固定Seed: 分割後も同じ画像を繰り返さないよう、完了画像数に合わせて自動補正
+- ランダムSeed (`-1` / 未指定): ジョブ開始時に一度だけ確定し、分割前と同じ連番を維持
+- グリッド: ランナーからの全リクエストで `return_grid=false` と `grid_save=false` を強制
+- WebUI本体のグローバル設定: 変更しない
+
+グリッド設定はリクエスト中だけ上書きされ、個別画像の保存は従来どおり行われます。payloadにグリッド有効設定が書かれていても、ランナー実行時は無効になります。
+
+```powershell
+python -m sd_webui_batch.cli .\examples\prompts.txt --payload-json .\examples\payload.json --chunk-size 100
+```
+
+HTTPエラーになった送信は自動再試行せず、そのプロンプトの残り送信を飛ばします。「エラーで停止」が無効なら次のプロンプトへ進みます。タイムアウトや接続切断は、WebUI側が生成を継続中か判断できないため、重複送信を避けて全体を停止します。
+
+GUIの `WebUI Skip` を使った送信は、WebUIが途中まで何枚保存したかAPI応答だけでは確定できません。その送信は確定枚数へ加算せず「保存枚数不明」と表示し、次の最大100枚送信から処理を続けます。`WebUI Interrupt` は後続送信も停止します。
 
 ## Hires. fix設定
 
