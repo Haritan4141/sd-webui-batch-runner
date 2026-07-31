@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .client import SdWebuiApiError, SdWebuiClient
+from .batching import (
+    DEFAULT_MAX_IMAGES_PER_REQUEST,
+    HARD_MAX_IMAGES_PER_REQUEST,
+    BatchChunk,
+    split_payload_into_chunks,
+)
+from .client import SdWebuiApiError, SdWebuiClient, SdWebuiTransportError
 from .parser import PromptJob, PromptParseError, parse_prompt_note, read_text_file
 
 
@@ -35,11 +41,22 @@ def main(argv: list[str] | None = None) -> int:
         subdir = get_subdirectory(job, sanitize=not args.no_sanitize_subdir)
         print(f"[{job.index}] {job.title} -> {subdir}")
 
+    try:
+        job_chunks = [
+            split_payload_into_chunks(
+                build_payload(job, args, base_payload),
+                max_images_per_request=args.chunk_size,
+            )
+            for job in jobs
+        ]
+    except ValueError as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        return 2
+
     if args.dry_run:
-        print("\nDry run payload preview:")
-        for job in jobs:
-            payload = build_payload(job, args, base_payload)
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print("\nDry run request plan (no API calls will be made):")
+        for job, chunks in zip(jobs, job_chunks):
+            _print_dry_run_plan(job, chunks)
         return 0
 
     client = SdWebuiClient(
@@ -50,25 +67,53 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     failures = 0
-    for number, job in enumerate(jobs, start=1):
-        payload = build_payload(job, args, base_payload)
-        subdir = payload["override_settings"]["directories_filename_pattern"]
-        print(f"\n{number}/{len(jobs)} generating: {job.title}")
+    abort_run = False
+    for number, (job, chunks) in enumerate(zip(jobs, job_chunks), start=1):
+        subdir = chunks[0].payload["override_settings"]["directories_filename_pattern"]
+        print(f"\nTask {number}/{len(jobs)}: {job.title}")
         print(f"subdirectory: {subdir}")
+        print(
+            f"{chunks[0].total_images} image(s) in {len(chunks)} request(s); "
+            f"up to {args.chunk_size} image(s) per request"
+        )
 
-        try:
-            response = client.txt2img(payload)
-        except SdWebuiApiError as error:
-            failures += 1
-            print(f"failed: {error}", file=sys.stderr)
-            if args.stop_on_error:
+        for chunk in chunks:
+            print(
+                f"[task {number}/{len(jobs)}][request {chunk.ordinal}/{chunk.total_chunks}] "
+                f"sending images {chunk.image_start}-{chunk.image_end}/{chunk.total_images}"
+            )
+            try:
+                response = client.txt2img(chunk.payload)
+            except SdWebuiTransportError as error:
+                failures += 1
+                abort_run = True
+                print(f"connection state unknown: {error}", file=sys.stderr)
+                print(
+                    "Stopping all tasks because WebUI may still be processing this request. "
+                    "The request will not be retried automatically.",
+                    file=sys.stderr,
+                )
                 break
-            continue
+            except SdWebuiApiError as error:
+                failures += 1
+                print(f"request failed: {error}", file=sys.stderr)
+                print(
+                    "Skipping the remaining requests for this task; this request will not "
+                    "be retried automatically.",
+                    file=sys.stderr,
+                )
+                if args.stop_on_error:
+                    abort_run = True
+                break
 
-        info = response.get("info")
-        print("completed")
-        if args.print_info and info:
-            print(info)
+            percent = chunk.image_end / chunk.total_images * 100
+            print(f"completed through image {chunk.image_end}/{chunk.total_images} ({percent:.1f}%)")
+            info = response.get("info")
+            if args.print_info and info:
+                print(info)
+
+        if abort_run:
+            break
 
     if failures:
         print(f"\nCompleted with {failures} failure(s).", file=sys.stderr)
@@ -99,6 +144,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Batch Count / n_iter. If omitted, uses payload n_iter or 1.",
     )
     parser.add_argument("--batch-size", type=int, help="Batch Size. If omitted, uses payload batch_size or 1.")
+    parser.add_argument(
+        "--chunk-size",
+        type=_parse_chunk_size,
+        default=DEFAULT_MAX_IMAGES_PER_REQUEST,
+        help=(
+            "Maximum generated images per API request (1-"
+            f"{HARD_MAX_IMAGES_PER_REQUEST}). Default: %(default)s."
+        ),
+    )
     parser.add_argument("--negative-prompt", help="Negative prompt applied to all jobs.")
     parser.add_argument("--sampler-name", help="Sampler name applied to all jobs.")
     parser.add_argument("--scheduler", help="Scheduler name applied to all jobs.")
@@ -127,9 +181,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--password", help="API basic auth password, if WebUI uses --api-auth.")
     parser.add_argument("--limit", type=int, help="Run only the first N jobs.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and print payloads without calling WebUI.")
-    parser.add_argument("--print-info", action="store_true", help="Print WebUI generation info after each job.")
+    parser.add_argument("--print-info", action="store_true", help="Print WebUI generation info after each request.")
     parser.add_argument("--stop-on-error", action="store_true", help="Stop at the first failed job.")
     return parser
+
+
+def _parse_chunk_size(value: str) -> int:
+    try:
+        chunk_size = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("chunk size must be an integer") from error
+
+    if not 1 <= chunk_size <= HARD_MAX_IMAGES_PER_REQUEST:
+        raise argparse.ArgumentTypeError(
+            f"chunk size must be between 1 and {HARD_MAX_IMAGES_PER_REQUEST}"
+        )
+    return chunk_size
+
+
+def _print_dry_run_plan(job: PromptJob, chunks: tuple[BatchChunk, ...]) -> None:
+    first = chunks[0]
+    print(
+        f"\n[{job.index}] {job.title}: {first.total_images} image(s), "
+        f"{first.total_chunks} request(s)"
+    )
+    for chunk in chunks:
+        print(
+            f"  request {chunk.ordinal}/{chunk.total_chunks}: "
+            f"images {chunk.image_start}-{chunk.image_end}, "
+            f"n_iter={chunk.payload['n_iter']}, seed={chunk.payload.get('seed', 'default')}"
+        )
+    print("  first request payload:")
+    print(json.dumps(first.payload, ensure_ascii=False, indent=2))
 
 
 def load_payload_json(path: Path | None) -> dict[str, Any]:
@@ -186,6 +269,11 @@ def build_payload(job: PromptJob, args: argparse.Namespace, base_payload: dict[s
     apply_hires_compatibility_defaults(payload)
 
     override_settings = dict(payload.get("override_settings") or {})
+    # The runner consumes individually saved images and never uses a grid.
+    # Both settings must be false because Forge creates a grid when either
+    # return_grid or grid_save is enabled.
+    override_settings["return_grid"] = False
+    override_settings["grid_save"] = False
     override_settings["save_to_dirs"] = True
     override_settings["directories_filename_pattern"] = get_subdirectory(
         job,
