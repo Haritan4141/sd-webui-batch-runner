@@ -367,6 +367,13 @@ GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`
   - RequestSet書き出し順を依頼IDの昇順に固定した。依頼Inboxの新しい順表示やGUIの選択順に影響されず、今後の生成順はID 1→Nとなる。既存を含む68テスト成功。
   - 大量Dynamic PromptsのDry Run準備をバックグラウンド化し、準備進捗表示、準備中の停止、GUIログのリクエスト要約、イベント処理の分割を追加した。Manifestには全件を引き続き保存する。73ジョブ×100枚の実データDry Runでボタン復帰約0.014秒、全準備・確認約0.99秒、GUI応答維持を確認し、既存を含む71テスト成功。
   - `run_forge_neo_gui.bat` と `examples/payload_forge_neo.json` を共有対象にした。BATはメインPCのZドライブ構成とサブPCの `C:\[wildcards]\wildcards` を自動判別し、Manifest先もPC構成に合わせて切り替える。
+  - PromptSetをJSON正本として編集するワークフローへ更新した。`PromptSetを開く` は同じファイルパスの取込単位を同期更新し、`PromptSetを追加` は元JSONを上書きできない独立コピーとして追加する。
+  - プロンプトタブへ `JSONへ上書き保存`、`名前を付けて保存`、`配布用PromptSetを書き出し` を追加した。通常保存は未知のJSON項目を保持し、上書き前JSONを `.promptset_backups` へ退避する。配布用保存は絵柄規則を含む適用済み設定を各jobの `settings_override` へ埋め込む。
+  - PromptSetの任意 `status`、`enabled`、`notes` を往復可能にし、ローカル依頼が存在しない別PCでも `source_request_id` を失わないようSQLite schema version 4へ移行した。JSON未保存状態もDBへ保持する。同じJSONの再読込ではJSONにない状態・有効・メモを保持し、追加・更新・削除を同期する。
+  - 配布先をプロジェクト内の `sd-webui-batch-runner/SD-PromptSets`（Git管理対象外）とし、9700X／14100Fは `\\DESKTOP-5NPLIIV\Users\Haritan\Documents\sd-webui-batch-runner\SD-PromptSets` のJSONを開いて各PCのローカルSQLiteへ取り込む運用にした。SQLite DB本体はPC間共有しない。共有JSONを開いた後はローカルSQLite、バッチへ渡した後はメモリ上のジョブを使うため、生成中のネットワーク切断は影響しない。共有JSONの保存・再読込時だけ接続が必要。
+  - `開いているPromptSetのみ表示` を既定にし、PromptSetを開く／追加した直後は対象取込単位だけを表示する。件数欄は表示件数とDB全件数を分け、過去セットはチェックを外すと確認できる。旧コピーが残ってDB全体128件でも、開いた64件を追加と誤認しない表示にした。
+  - `生成準備済み全件をバッチへ` を `表示中の生成準備済みをバッチへ` へ変更し、一覧で非表示になっている過去セットをバッチ対象から除外した。
+  - 新しいPromptSet開閉・同期・追加・保存・未知項目保持・バックアップ・配布設定・表示フィルター・schema移行テストを追加し、既存を含む77テスト成功。実際の64件PromptSetコピーでorder 1→64、source_request_id、編集内容、Upscalerを配布先DBまで往復確認した。
 
 - 2026-05-12
   - 初版作成。

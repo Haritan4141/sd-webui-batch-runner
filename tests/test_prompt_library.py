@@ -318,7 +318,194 @@ class PromptLibraryTests(unittest.TestCase):
             job = library.list_jobs()[0]
 
             self.assertEqual(job.request_id, request_id)
+            self.assertEqual(job.source_request_id, request_id)
             self.assertEqual(library.get_request(request_id).status, "prompt_generated")
+
+    def test_open_prompt_set_updates_in_place_and_preserves_local_fields(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_set = root / "PromptSet.json"
+            prompt_set.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collection": "linked-document",
+                        "jobs": [
+                            {
+                                "order": 2,
+                                "source_request_id": 202,
+                                "title": "second",
+                                "style": "bgk",
+                                "prompt": "prompt second",
+                            },
+                            {
+                                "order": 1,
+                                "source_request_id": 201,
+                                "title": "first",
+                                "style": "ata",
+                                "prompt": "prompt first",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            library = PromptLibrary(root / "library.sqlite3")
+
+            first_result = library.open_prompt_set(prompt_set)
+            first_jobs = library.list_jobs()
+            self.assertTrue(first_result.created)
+            self.assertEqual([job.title for job in first_jobs], ["first", "second"])
+            self.assertEqual(first_jobs[0].source_request_id, 201)
+            self.assertIsNone(first_jobs[0].request_id)
+            library.update_job(
+                first_jobs[0].id,
+                title=first_jobs[0].title,
+                prompt=first_jobs[0].prompt,
+                style_key=first_jobs[0].style_key,
+                status="ready",
+                enabled=False,
+                settings_override=first_jobs[0].settings_override,
+                notes="local review",
+            )
+
+            prompt_set.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collection": "linked-document",
+                        "jobs": [
+                            {
+                                "order": 1,
+                                "source_request_id": 201,
+                                "title": "first updated",
+                                "style": "ata",
+                                "prompt": "prompt first updated",
+                            },
+                            {
+                                "order": 3,
+                                "source_request_id": 203,
+                                "title": "third",
+                                "style": "mcp",
+                                "prompt": "prompt third",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            second_result = library.open_prompt_set(prompt_set)
+            updated_jobs = library.list_jobs()
+
+            self.assertFalse(second_result.created)
+            self.assertEqual(second_result.collection_id, first_result.collection_id)
+            self.assertEqual(second_result.added, 1)
+            self.assertEqual(second_result.updated, 1)
+            self.assertEqual(second_result.removed, 1)
+            self.assertEqual(len(library.list_collections()), 1)
+            self.assertEqual([job.title for job in updated_jobs], ["first updated", "third"])
+            self.assertEqual(updated_jobs[0].status, "ready")
+            self.assertFalse(updated_jobs[0].enabled)
+            self.assertEqual(updated_jobs[0].notes, "local review")
+
+    def test_add_prompt_set_creates_an_independent_copy(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_set = root / "PromptSet.json"
+            prompt_set.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collection": "copy-test",
+                        "jobs": [{"title": "one", "prompt": "prompt one"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            library = PromptLibrary(root / "library.sqlite3")
+
+            library.open_prompt_set(prompt_set)
+            copied_id, copied_count = library.import_prompt_set(
+                prompt_set, as_copy=True
+            )
+            collections = library.list_collections()
+
+            self.assertEqual(copied_count, 1)
+            self.assertEqual(len(collections), 2)
+            copied = library.get_collection(copied_id)
+            self.assertEqual(copied.source_kind, "promptset-copy")
+            self.assertEqual(len(library.list_jobs()), 2)
+
+    def test_prompt_set_save_preserves_unknown_fields_and_portable_settings(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_set = root / "PromptSet.json"
+            prompt_set.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "collection": "save-test",
+                        "producer": {"name": "codex"},
+                        "jobs": [
+                            {
+                                "order": 1,
+                                "source_request_id": 501,
+                                "title": "editable",
+                                "style": "ata",
+                                "prompt": "before",
+                                "custom_field": "keep-me",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            library = PromptLibrary(root / "library.sqlite3")
+            result = library.open_prompt_set(prompt_set)
+            job = library.list_jobs()[0]
+            library.update_job(
+                job.id,
+                title="edited",
+                prompt="after",
+                style_key="ata",
+                status="ready",
+                enabled=False,
+                settings_override={},
+                notes="reviewed",
+            )
+            self.assertTrue(library.get_collection(result.collection_id).json_dirty)
+
+            library.export_prompt_set(result.collection_id, prompt_set)
+            self.assertFalse(library.get_collection(result.collection_id).json_dirty)
+            saved = json.loads(prompt_set.read_text(encoding="utf-8"))
+            portable_path = root / "Ready" / "PromptSet.json"
+            library.export_prompt_set(
+                result.collection_id,
+                portable_path,
+                portable=True,
+                create_backup=False,
+            )
+            portable = json.loads(portable_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(saved["producer"], {"name": "codex"})
+            self.assertEqual(saved["jobs"][0]["custom_field"], "keep-me")
+            self.assertEqual(saved["jobs"][0]["title"], "edited")
+            self.assertEqual(saved["jobs"][0]["prompt"], "after")
+            self.assertEqual(saved["jobs"][0]["source_request_id"], 501)
+            self.assertEqual(saved["jobs"][0]["status"], "ready")
+            self.assertFalse(saved["jobs"][0]["enabled"])
+            self.assertEqual(saved["jobs"][0]["notes"], "reviewed")
+            self.assertNotIn("settings_override", saved["jobs"][0])
+            self.assertEqual(
+                portable["jobs"][0]["settings_override"]["hr_upscaler"],
+                "Lanczos",
+            )
+            backups = list((root / ".promptset_backups").glob("PromptSet.*.json"))
+            self.assertEqual(len(backups), 1)
 
     def test_initialization_migrates_version_one_database(self):
         with TemporaryDirectory() as directory:
@@ -366,11 +553,16 @@ class PromptLibraryTests(unittest.TestCase):
                 columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(prompt_jobs)")
                 }
+                collection_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(collections)")
+                }
                 request_table = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='requests'"
                 ).fetchone()
 
             self.assertIn("request_id", columns)
+            self.assertIn("source_request_id", columns)
+            self.assertIn("json_dirty", collection_columns)
             self.assertIsNotNone(request_table)
 
 

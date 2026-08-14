@@ -1,4 +1,6 @@
 import math
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 from sd_webui_batch.gui import (
@@ -9,17 +11,61 @@ from sd_webui_batch.gui import (
     normalize_webui_progress,
 )
 from sd_webui_batch.library_gui import (
+    DEFAULT_PROMPTSET_DISTRIBUTION_DIR,
     PROMPT_STATUS_LABELS,
     PROMPT_STATUS_VALUES,
     REQUEST_FILTER_CHOICES,
     REQUEST_STATUS_LABELS,
     REQUEST_STATUS_VALUES,
+    prompt_records_for_display,
+    ready_job_ids_for_display,
     request_status_matches_filter,
 )
 from sd_webui_batch.prompt_library import REQUEST_STATUSES
 
 
 class GuiProgressHelperTests(unittest.TestCase):
+    def test_promptset_distribution_folder_is_inside_the_project(self):
+        project_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(
+            DEFAULT_PROMPTSET_DISTRIBUTION_DIR,
+            project_root / "SD-PromptSets",
+        )
+
+    def test_ready_batch_action_uses_only_visible_prompt_rows(self):
+        jobs = {
+            1: SimpleNamespace(enabled=True, status="ready"),
+            2: SimpleNamespace(enabled=True, status="draft"),
+            3: SimpleNamespace(enabled=True, status="ready"),
+            4: SimpleNamespace(enabled=False, status="ready"),
+        }
+
+        self.assertEqual(
+            ready_job_ids_for_display(jobs, (1, 2, 4)),
+            (1,),
+        )
+
+    def test_prompt_display_can_limit_rows_to_the_open_collection(self):
+        records = [
+            SimpleNamespace(id=1, collection_id=10),
+            SimpleNamespace(id=2, collection_id=10),
+            SimpleNamespace(id=3, collection_id=20),
+        ]
+
+        current = prompt_records_for_display(
+            records,
+            current_collection_id=10,
+            current_only=True,
+        )
+        all_records = prompt_records_for_display(
+            records,
+            current_collection_id=10,
+            current_only=False,
+        )
+
+        self.assertEqual([record.id for record in current], [1, 2])
+        self.assertEqual([record.id for record in all_records], [1, 2, 3])
+
     def test_library_statuses_have_reversible_japanese_labels(self):
         self.assertEqual(set(REQUEST_STATUS_LABELS), set(REQUEST_STATUSES))
         self.assertEqual(

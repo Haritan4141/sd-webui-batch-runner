@@ -5,14 +5,16 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Any, Iterable
 
 from .parser import PromptJob, extract_style_key, parse_prompt_note, read_text_file
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 PROMPT_SET_SCHEMA_VERSION = 1
 REQUEST_SET_SCHEMA_VERSION = 1
 REQUEST_STATUSES = (
@@ -52,6 +54,7 @@ class LibraryJob:
     effective_settings: dict[str, Any]
     notes: str
     request_id: int | None = None
+    source_request_id: int | None = None
 
     @property
     def effective_upscaler(self) -> str:
@@ -86,6 +89,35 @@ class RequestRecord:
     @property
     def preview(self) -> str:
         return " ".join(self.raw_text.split())[:120]
+
+
+@dataclass(frozen=True)
+class PromptCollection:
+    id: int
+    name: str
+    source_path: str
+    source_kind: str
+    json_dirty: bool
+    created_at: str
+    updated_at: str
+
+    @property
+    def is_prompt_set(self) -> bool:
+        return self.source_kind in {"promptset-json", "promptset-copy"}
+
+    @property
+    def is_writable_prompt_set(self) -> bool:
+        return self.source_kind == "promptset-json" and bool(self.source_path)
+
+
+@dataclass(frozen=True)
+class PromptSetSyncResult:
+    collection_id: int
+    total: int
+    added: int
+    updated: int
+    removed: int
+    created: bool
 
 
 LATENT_UPSCALER = "Latent (antialiased)"
@@ -233,6 +265,7 @@ class PromptLibrary:
                     name TEXT NOT NULL,
                     source_path TEXT NOT NULL DEFAULT '',
                     source_kind TEXT NOT NULL DEFAULT '',
+                    json_dirty INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -271,6 +304,7 @@ class PromptLibrary:
                     settings_override_json TEXT NOT NULL DEFAULT '{}',
                     notes TEXT NOT NULL DEFAULT '',
                     source_line INTEGER NOT NULL DEFAULT 0,
+                    source_request_id INTEGER,
                     request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -290,6 +324,17 @@ class PromptLibrary:
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(prompt_jobs)").fetchall()
             }
+            collection_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(collections)").fetchall()
+            }
+            if "json_dirty" not in collection_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE collections
+                    ADD COLUMN json_dirty INTEGER NOT NULL DEFAULT 0
+                    """
+                )
             if "request_id" not in prompt_columns:
                 connection.execute(
                     """
@@ -297,10 +342,30 @@ class PromptLibrary:
                     ADD COLUMN request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL
                     """
                 )
+            if "source_request_id" not in prompt_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE prompt_jobs
+                    ADD COLUMN source_request_id INTEGER
+                    """
+                )
+            connection.execute(
+                """
+                UPDATE prompt_jobs
+                SET source_request_id = request_id
+                WHERE source_request_id IS NULL AND request_id IS NOT NULL
+                """
+            )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_prompt_jobs_request
                 ON prompt_jobs(request_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_prompt_jobs_source_request
+                ON prompt_jobs(collection_id, source_request_id)
                 """
             )
             connection.execute(
@@ -373,60 +438,236 @@ class PromptLibrary:
             ],
         )
 
-    def import_prompt_set(self, path: str | Path) -> tuple[int, int]:
-        source = Path(path)
-        try:
-            data = json.loads(source.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise PromptLibraryError(f"PromptSet JSONを読み込めません: {error}") from error
+    def import_prompt_set(
+        self, path: str | Path, *, as_copy: bool = False
+    ) -> tuple[int, int]:
+        """Append a PromptSet as an independent collection.
 
-        if not isinstance(data, dict):
-            raise PromptLibraryError("PromptSet JSONのルートはオブジェクトにしてください。")
-        if data.get("schema_version") != PROMPT_SET_SCHEMA_VERSION:
-            raise PromptLibraryError(
-                f"未対応のschema_versionです: {data.get('schema_version')!r}"
-            )
-        raw_jobs = data.get("jobs")
-        if not isinstance(raw_jobs, list) or not raw_jobs:
-            raise PromptLibraryError("PromptSet JSONのjobsには1件以上必要です。")
+        ``as_copy`` is used by the GUI's explicit add operation. A copied
+        collection keeps its original path as a template, but cannot overwrite
+        that source until it is saved under a new name.
+        """
 
-        jobs: list[dict[str, Any]] = []
-        for index, item in enumerate(raw_jobs, start=1):
-            if not isinstance(item, dict):
-                raise PromptLibraryError(f"jobs[{index}]はオブジェクトにしてください。")
-            title = str(item.get("title", "")).strip()
-            prompt = str(item.get("prompt", "")).strip()
-            if not title or not prompt:
-                raise PromptLibraryError(
-                    f"jobs[{index}]のtitleとpromptは空にできません。"
-                )
-            style_key = str(item.get("style", "")).strip() or extract_style_key(title)
-            settings_override = item.get("settings_override", {})
-            if not isinstance(settings_override, dict):
-                raise PromptLibraryError(
-                    f"jobs[{index}].settings_overrideはオブジェクトにしてください。"
-                )
-            jobs.append(
-                {
-                    "title": title,
-                    "prompt": prompt,
-                    "style_key": style_key,
-                    "settings_override": settings_override,
-                    "source_line": 0,
-                    "request_id": _optional_positive_int(
-                        item.get("source_request_id"),
-                        f"jobs[{index}].source_request_id",
-                    ),
-                }
-            )
-
+        source, data, jobs = self._read_prompt_set(path)
         collection_name = str(data.get("collection", "")).strip() or source.stem
         return self._insert_collection(
             collection_name,
             source_path=str(source.resolve()),
-            source_kind="promptset-json",
+            source_kind="promptset-copy" if as_copy else "promptset-json",
             jobs=jobs,
         )
+
+    def open_prompt_set(self, path: str | Path) -> PromptSetSyncResult:
+        """Open a PromptSet, updating its existing linked collection in place."""
+
+        source, data, jobs = self._read_prompt_set(path)
+        resolved_source = str(source.resolve())
+        collection_name = str(data.get("collection", "")).strip() or source.stem
+        self.initialize()
+        with self._connection() as connection:
+            linked_rows = connection.execute(
+                """
+                SELECT * FROM collections
+                WHERE source_kind = 'promptset-json'
+                ORDER BY id DESC
+                """
+            ).fetchall()
+            normalized_source = _normalized_path(resolved_source)
+            linked = next(
+                (
+                    row
+                    for row in linked_rows
+                    if _normalized_path(str(row["source_path"])) == normalized_source
+                ),
+                None,
+            )
+
+        if linked is None:
+            collection_id, count = self._insert_collection(
+                collection_name,
+                source_path=resolved_source,
+                source_kind="promptset-json",
+                jobs=jobs,
+            )
+            return PromptSetSyncResult(
+                collection_id=collection_id,
+                total=count,
+                added=count,
+                updated=0,
+                removed=0,
+                created=True,
+            )
+
+        return self._sync_prompt_set_collection(
+            int(linked["id"]),
+            source_path=resolved_source,
+            jobs=jobs,
+        )
+
+    def export_prompt_set(
+        self,
+        collection_id: int,
+        path: str | Path,
+        *,
+        portable: bool = False,
+        relink: bool = False,
+        create_backup: bool = True,
+    ) -> int:
+        """Write one collection to PromptSet JSON using its source as a template.
+
+        Normal saves keep only explicit per-job settings. Portable saves bake
+        effective style settings into each job so another PC receives the same
+        generation settings even when its local style rules differ.
+        """
+
+        self.initialize()
+        destination = Path(path)
+        with self._connection() as connection:
+            collection_row = connection.execute(
+                "SELECT * FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()
+            if collection_row is None:
+                raise PromptLibraryError(
+                    f"取込単位ID {collection_id} が見つかりません。"
+                )
+            rows = connection.execute(
+                """
+                SELECT j.*, c.name AS collection_name
+                FROM prompt_jobs AS j
+                JOIN collections AS c ON c.id = j.collection_id
+                WHERE j.collection_id = ?
+                ORDER BY j.sort_order, j.id
+                """,
+                (collection_id,),
+            ).fetchall()
+            rules = self._style_rule_map(connection)
+
+        if not rows:
+            raise PromptLibraryError("書き出すプロンプトがありません。")
+
+        template_path = Path(str(collection_row["source_path"]))
+        template = self._read_prompt_set_template(template_path)
+        template_jobs = template.get("jobs", [])
+        template_by_request: dict[int, dict[str, Any]] = {}
+        template_by_order: dict[int, dict[str, Any]] = {}
+        if isinstance(template_jobs, list):
+            for index, item in enumerate(template_jobs, start=1):
+                if not isinstance(item, dict):
+                    continue
+                request_id = _optional_positive_int(
+                    item.get("source_request_id"),
+                    f"jobs[{index}].source_request_id",
+                )
+                order = _optional_positive_int(
+                    item.get("order", index), f"jobs[{index}].order"
+                )
+                if request_id is not None:
+                    template_by_request.setdefault(request_id, item)
+                if order is not None:
+                    template_by_order.setdefault(order, item)
+
+        output_jobs: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._row_to_job(row, rules)
+            source_request_id = record.source_request_id or record.request_id
+            template_item = None
+            if source_request_id is not None:
+                template_item = template_by_request.get(source_request_id)
+            if template_item is None:
+                template_item = template_by_order.get(record.sort_order)
+            item = deepcopy(template_item) if template_item is not None else {}
+            item["order"] = record.sort_order
+            if source_request_id is None:
+                item.pop("source_request_id", None)
+            else:
+                item["source_request_id"] = source_request_id
+            item["title"] = record.title
+            item["style"] = record.style_key
+            item["prompt"] = record.prompt
+            item["status"] = record.status
+            item["enabled"] = record.enabled
+            if record.notes:
+                item["notes"] = record.notes
+            else:
+                item.pop("notes", None)
+            settings = (
+                record.effective_settings if portable else record.settings_override
+            )
+            if settings:
+                item["settings_override"] = deepcopy(settings)
+            else:
+                item.pop("settings_override", None)
+            output_jobs.append(item)
+
+        payload = deepcopy(template)
+        payload["schema_version"] = PROMPT_SET_SCHEMA_VERSION
+        payload["collection"] = (
+            str(template.get("collection", "")).strip()
+            or str(collection_row["name"])
+        )
+        payload["jobs"] = output_jobs
+        _write_json_atomic(destination, payload, create_backup=create_backup)
+
+        source_path = str(collection_row["source_path"])
+        saved_to_linked_source = (
+            bool(source_path)
+            and _normalized_path(destination) == _normalized_path(source_path)
+        )
+        if relink or (not portable and saved_to_linked_source):
+            with self._connection() as connection:
+                if relink:
+                    connection.execute(
+                        """
+                        UPDATE collections
+                        SET source_path = ?, source_kind = 'promptset-json',
+                            json_dirty = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (str(destination.resolve()), _utc_now(), collection_id),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE collections
+                        SET json_dirty = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (_utc_now(), collection_id),
+                    )
+        return len(output_jobs)
+
+    def list_collections(self) -> list[PromptCollection]:
+        self.initialize()
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM collections ORDER BY id DESC"
+            ).fetchall()
+        return [self._row_to_collection(row) for row in rows]
+
+    def get_collection(self, collection_id: int) -> PromptCollection:
+        self.initialize()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()
+        if row is None:
+            raise PromptLibraryError(
+                f"取込単位ID {collection_id} が見つかりません。"
+            )
+        return self._row_to_collection(row)
+
+    def collection_job_ids(self, collection_id: int) -> tuple[int, ...]:
+        self.initialize()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM prompt_jobs
+                WHERE collection_id = ?
+                ORDER BY sort_order, id
+                """,
+                (collection_id,),
+            ).fetchall()
+        return tuple(int(row["id"]) for row in rows)
 
     def import_request_set(self, path: str | Path) -> int:
         source_path = Path(path)
@@ -655,7 +896,16 @@ class PromptLibrary:
                 """,
                 (collection_id, int(order_row["next_order"]), now, now),
             )
-            return int(cursor.lastrowid)
+            job_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                UPDATE collections
+                SET json_dirty = 1, updated_at = ?
+                WHERE id = ? AND source_kind IN ('promptset-json', 'promptset-copy')
+                """,
+                (now, collection_id),
+            )
+            return job_id
 
     def list_jobs(self) -> list[LibraryJob]:
         self.initialize()
@@ -729,6 +979,16 @@ class PromptLibrary:
             )
             if cursor.rowcount != 1:
                 raise PromptLibraryError(f"プロンプトID {job_id} が見つかりません。")
+            connection.execute(
+                """
+                UPDATE collections
+                SET json_dirty = 1, updated_at = ?
+                WHERE id = (
+                    SELECT collection_id FROM prompt_jobs WHERE id = ?
+                ) AND source_kind IN ('promptset-json', 'promptset-copy')
+                """,
+                (now, job_id),
+            )
 
     def delete_jobs(self, job_ids: Iterable[int]) -> int:
         ids = tuple(dict.fromkeys(int(value) for value in job_ids))
@@ -736,9 +996,30 @@ class PromptLibrary:
             return 0
         placeholders = ",".join("?" for _ in ids)
         with self._connection() as connection:
+            collection_rows = connection.execute(
+                f"""
+                SELECT DISTINCT collection_id FROM prompt_jobs
+                WHERE id IN ({placeholders})
+                """,
+                ids,
+            ).fetchall()
             cursor = connection.execute(
                 f"DELETE FROM prompt_jobs WHERE id IN ({placeholders})", ids
             )
+            collection_ids = tuple(
+                int(row["collection_id"]) for row in collection_rows
+            )
+            if collection_ids:
+                collection_placeholders = ",".join("?" for _ in collection_ids)
+                connection.execute(
+                    f"""
+                    UPDATE collections
+                    SET json_dirty = 1, updated_at = ?
+                    WHERE id IN ({collection_placeholders})
+                      AND source_kind IN ('promptset-json', 'promptset-copy')
+                    """,
+                    (_utc_now(), *collection_ids),
+                )
             return int(cursor.rowcount)
 
     def list_style_rules(self) -> list[StyleRule]:
@@ -824,6 +1105,245 @@ class PromptLibrary:
             )
         return result
 
+    @staticmethod
+    def _read_prompt_set(
+        path: str | Path,
+    ) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+        source = Path(path)
+        try:
+            data = json.loads(source.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise PromptLibraryError(f"PromptSet JSONを読み込めません: {error}") from error
+
+        if not isinstance(data, dict):
+            raise PromptLibraryError("PromptSet JSONのルートはオブジェクトにしてください。")
+        if data.get("schema_version") != PROMPT_SET_SCHEMA_VERSION:
+            raise PromptLibraryError(
+                f"未対応のschema_versionです: {data.get('schema_version')!r}"
+            )
+        raw_jobs = data.get("jobs")
+        if not isinstance(raw_jobs, list) or not raw_jobs:
+            raise PromptLibraryError("PromptSet JSONのjobsには1件以上必要です。")
+
+        jobs: list[dict[str, Any]] = []
+        used_orders: set[int] = set()
+        for index, item in enumerate(raw_jobs, start=1):
+            if not isinstance(item, dict):
+                raise PromptLibraryError(f"jobs[{index}]はオブジェクトにしてください。")
+            title = str(item.get("title", "")).strip()
+            prompt = str(item.get("prompt", "")).strip()
+            if not title or not prompt:
+                raise PromptLibraryError(
+                    f"jobs[{index}]のtitleとpromptは空にできません。"
+                )
+            style_key = str(item.get("style", "")).strip() or extract_style_key(title)
+            settings_override = item.get("settings_override", {})
+            if not isinstance(settings_override, dict):
+                raise PromptLibraryError(
+                    f"jobs[{index}].settings_overrideはオブジェクトにしてください。"
+                )
+            order = _optional_positive_int(
+                item.get("order", index), f"jobs[{index}].order"
+            )
+            if order is None or order in used_orders:
+                raise PromptLibraryError(
+                    f"jobs[{index}].orderは重複しない正の整数にしてください。"
+                )
+            used_orders.add(order)
+
+            status_provided = "status" in item
+            status = str(item.get("status", "draft")).strip() or "draft"
+            if status not in {"draft", "ready", "generated"}:
+                raise PromptLibraryError(
+                    f"jobs[{index}].statusはdraft/ready/generatedにしてください。"
+                )
+            enabled_provided = "enabled" in item
+            enabled = item.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise PromptLibraryError(f"jobs[{index}].enabledは真偽値にしてください。")
+
+            jobs.append(
+                {
+                    "sort_order": order,
+                    "title": title,
+                    "prompt": prompt,
+                    "style_key": style_key,
+                    "settings_override": settings_override,
+                    "source_line": 0,
+                    "source_request_id": _optional_positive_int(
+                        item.get("source_request_id"),
+                        f"jobs[{index}].source_request_id",
+                    ),
+                    "status": status,
+                    "status_provided": status_provided,
+                    "enabled": enabled,
+                    "enabled_provided": enabled_provided,
+                    "notes": str(item.get("notes", "")).strip(),
+                    "notes_provided": "notes" in item,
+                }
+            )
+        jobs.sort(key=lambda job: int(job["sort_order"]))
+        return source, data, jobs
+
+    @staticmethod
+    def _read_prompt_set_template(path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            return {
+                "schema_version": PROMPT_SET_SCHEMA_VERSION,
+                "collection": path.stem.replace("_PromptSet", ""),
+                "jobs": [],
+            }
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise PromptLibraryError(
+                f"保存元のPromptSet JSONを読み込めません: {error}"
+            ) from error
+        if not isinstance(data, dict):
+            raise PromptLibraryError("保存元PromptSetのルートがオブジェクトではありません。")
+        if data.get("schema_version") != PROMPT_SET_SCHEMA_VERSION:
+            raise PromptLibraryError(
+                f"保存元PromptSetのschema_versionに対応していません: "
+                f"{data.get('schema_version')!r}"
+            )
+        return data
+
+    def _sync_prompt_set_collection(
+        self,
+        collection_id: int,
+        *,
+        source_path: str,
+        jobs: list[dict[str, Any]],
+    ) -> PromptSetSyncResult:
+        now = _utc_now()
+        with self._connection() as connection:
+            existing_rows = connection.execute(
+                """
+                SELECT * FROM prompt_jobs
+                WHERE collection_id = ?
+                ORDER BY sort_order, id
+                """,
+                (collection_id,),
+            ).fetchall()
+            remaining = {int(row["id"]): row for row in existing_rows}
+            by_source_request = {
+                int(row["source_request_id"]): row
+                for row in existing_rows
+                if row["source_request_id"] is not None
+            }
+            by_order = {int(row["sort_order"]): row for row in existing_rows}
+            added = 0
+            updated = 0
+            linked_request_ids: set[int] = set()
+
+            for job in jobs:
+                source_request_id = job.get("source_request_id")
+                row = None
+                if source_request_id is not None:
+                    row = by_source_request.get(int(source_request_id))
+                if row is None:
+                    candidate = by_order.get(int(job["sort_order"]))
+                    if candidate is not None and int(candidate["id"]) in remaining:
+                        row = candidate
+                if row is not None and int(row["id"]) not in remaining:
+                    row = None
+
+                request_id = self._linked_request_id(
+                    connection, source_request_id, linked_request_ids
+                )
+                if row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO prompt_jobs(
+                            collection_id, sort_order, title, prompt, style_key,
+                            status, enabled, settings_override_json, notes,
+                            source_line, source_request_id, request_id,
+                            created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        """,
+                        (
+                            collection_id,
+                            int(job["sort_order"]),
+                            job["title"],
+                            job["prompt"],
+                            job["style_key"],
+                            job["status"],
+                            int(bool(job["enabled"])),
+                            _dump_object(job["settings_override"]),
+                            job["notes"],
+                            source_request_id,
+                            request_id,
+                            now,
+                            now,
+                        ),
+                    )
+                    added += 1
+                    continue
+
+                row_id = int(row["id"])
+                remaining.pop(row_id, None)
+                status = job["status"] if job["status_provided"] else str(row["status"])
+                enabled = (
+                    bool(job["enabled"])
+                    if job["enabled_provided"]
+                    else bool(row["enabled"])
+                )
+                notes = job["notes"] if job["notes_provided"] else str(row["notes"])
+                connection.execute(
+                    """
+                    UPDATE prompt_jobs
+                    SET sort_order = ?, title = ?, prompt = ?, style_key = ?,
+                        status = ?, enabled = ?, settings_override_json = ?, notes = ?,
+                        source_line = 0, source_request_id = ?, request_id = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        int(job["sort_order"]),
+                        job["title"],
+                        job["prompt"],
+                        job["style_key"],
+                        status,
+                        int(enabled),
+                        _dump_object(job["settings_override"]),
+                        notes,
+                        source_request_id,
+                        request_id,
+                        now,
+                        row_id,
+                    ),
+                )
+                updated += 1
+
+            removed = len(remaining)
+            if remaining:
+                placeholders = ",".join("?" for _ in remaining)
+                connection.execute(
+                    f"DELETE FROM prompt_jobs WHERE id IN ({placeholders})",
+                    tuple(remaining),
+                )
+            connection.execute(
+                """
+                UPDATE collections
+                SET source_path = ?, source_kind = 'promptset-json',
+                    json_dirty = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (source_path, now, collection_id),
+            )
+            self._mark_requests_prompt_generated(
+                connection, linked_request_ids, now=now
+            )
+
+        return PromptSetSyncResult(
+            collection_id=collection_id,
+            total=len(jobs),
+            added=added,
+            updated=updated,
+            removed=removed,
+            created=False,
+        )
+
     def _insert_collection(
         self,
         name: str,
@@ -846,46 +1366,78 @@ class PromptLibrary:
             collection_id = int(cursor.lastrowid)
             linked_request_ids: set[int] = set()
             for order, job in enumerate(jobs, start=1):
-                request_id = job.get("request_id")
-                if request_id is not None:
-                    exists = connection.execute(
-                        "SELECT 1 FROM requests WHERE id = ?", (request_id,)
-                    ).fetchone()
-                    if exists is None:
-                        request_id = None
-                    else:
-                        linked_request_ids.add(int(request_id))
+                source_request_id = job.get(
+                    "source_request_id", job.get("request_id")
+                )
+                request_id = self._linked_request_id(
+                    connection, source_request_id, linked_request_ids
+                )
                 connection.execute(
                     """
                     INSERT INTO prompt_jobs(
                         collection_id, sort_order, title, prompt, style_key,
-                        settings_override_json, source_line, request_id, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, enabled, settings_override_json, notes,
+                        source_line, source_request_id, request_id,
+                        created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         collection_id,
-                        order,
+                        int(job.get("sort_order", order)),
                         job["title"],
                         job["prompt"],
                         job.get("style_key", ""),
+                        job.get("status", "draft"),
+                        int(bool(job.get("enabled", True))),
                         _dump_object(job.get("settings_override", {})),
+                        str(job.get("notes", "")).strip(),
                         int(job.get("source_line", 0)),
+                        source_request_id,
                         request_id,
                         now,
                         now,
                     ),
                 )
-            if linked_request_ids:
-                placeholders = ",".join("?" for _ in linked_request_ids)
-                connection.execute(
-                    f"""
-                    UPDATE requests
-                    SET status = 'prompt_generated', updated_at = ?
-                    WHERE id IN ({placeholders})
-                    """,
-                    (now, *sorted(linked_request_ids)),
-                )
+            self._mark_requests_prompt_generated(
+                connection, linked_request_ids, now=now
+            )
         return collection_id, len(jobs)
+
+    @staticmethod
+    def _linked_request_id(
+        connection: sqlite3.Connection,
+        source_request_id: int | None,
+        linked_request_ids: set[int],
+    ) -> int | None:
+        if source_request_id is None:
+            return None
+        request_id = int(source_request_id)
+        exists = connection.execute(
+            "SELECT 1 FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if exists is None:
+            return None
+        linked_request_ids.add(request_id)
+        return request_id
+
+    @staticmethod
+    def _mark_requests_prompt_generated(
+        connection: sqlite3.Connection,
+        request_ids: set[int],
+        *,
+        now: str,
+    ) -> None:
+        if not request_ids:
+            return
+        placeholders = ",".join("?" for _ in request_ids)
+        connection.execute(
+            f"""
+            UPDATE requests
+            SET status = 'prompt_generated', updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now, *sorted(request_ids)),
+        )
 
     @staticmethod
     def _insert_request_row(
@@ -970,6 +1522,23 @@ class PromptLibrary:
             effective_settings=effective_settings,
             notes=str(row["notes"]),
             request_id=(int(row["request_id"]) if row["request_id"] is not None else None),
+            source_request_id=(
+                int(row["source_request_id"])
+                if row["source_request_id"] is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _row_to_collection(row: sqlite3.Row) -> PromptCollection:
+        return PromptCollection(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            source_path=str(row["source_path"]),
+            source_kind=str(row["source_kind"]),
+            json_dirty=bool(row["json_dirty"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
         )
 
     @staticmethod
@@ -1009,6 +1578,45 @@ def _utc_now() -> str:
 
 def _local_now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _normalized_path(value: str | Path) -> str:
+    path = Path(value)
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normcase(str(resolved))
+
+
+def _write_json_atomic(
+    destination: Path,
+    payload: dict[str, Any],
+    *,
+    create_backup: bool,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if create_backup and destination.is_file():
+        backup_directory = destination.parent / ".promptset_backups"
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = backup_directory / f"{destination.stem}.{stamp}{destination.suffix}"
+        try:
+            shutil.copy2(destination, backup_path)
+        except OSError as error:
+            raise PromptLibraryError(
+                f"PromptSetのバックアップを作成できません: {error}"
+            ) from error
+
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    except OSError as error:
+        raise PromptLibraryError(f"PromptSet JSONを保存できません: {error}") from error
 
 
 def _request_candidate_tokens(text: str) -> tuple[str, ...]:

@@ -9,6 +9,7 @@ from typing import Callable
 from .prompt_library import (
     DEFAULT_DATABASE_PATH,
     LibraryJob,
+    PromptCollection,
     PromptLibrary,
     PromptLibraryError,
     RequestRecord,
@@ -43,6 +44,9 @@ REQUEST_FILTER_CHOICES = (
     "完了",
     "すべて",
 )
+DEFAULT_PROMPTSET_DISTRIBUTION_DIR = (
+    Path(__file__).resolve().parent.parent / "SD-PromptSets"
+)
 
 
 def request_status_matches_filter(status: str, filter_label: str) -> bool:
@@ -51,6 +55,33 @@ def request_status_matches_filter(status: str, filter_label: str) -> bool:
     if filter_label == "未完了":
         return status != "done"
     return status == REQUEST_STATUS_VALUES.get(filter_label)
+
+
+def prompt_records_for_display(
+    records: list[LibraryJob],
+    *,
+    current_collection_id: int | None,
+    current_only: bool,
+) -> list[LibraryJob]:
+    if not current_only or current_collection_id is None:
+        return records
+    return [
+        record
+        for record in records
+        if record.collection_id == current_collection_id
+    ]
+
+
+def ready_job_ids_for_display(
+    jobs: dict[int, LibraryJob], visible_ids: tuple[int, ...]
+) -> tuple[int, ...]:
+    return tuple(
+        job_id
+        for job_id in visible_ids
+        if job_id in jobs
+        and jobs[job_id].enabled
+        and jobs[job_id].status == "ready"
+    )
 
 
 class PromptLibraryWindow:
@@ -89,14 +120,20 @@ class PromptLibraryWindow:
         )
         self.request_filter_var = tk.StringVar(value="未完了")
         self.request_summary_var = tk.StringVar(value="未読み込み")
+        self.promptset_source_var = tk.StringVar(value="PromptSetは選択されていません")
+        self.show_current_promptset_only_var = tk.BooleanVar(value=True)
 
         self.library = PromptLibrary(database_path)
         self.jobs: dict[int, LibraryJob] = {}
+        self.collections: dict[int, PromptCollection] = {}
         self.current_job_id: int | None = None
+        self.current_promptset_collection_id: int | None = None
+        self.dirty_promptset_ids: set[int] = set()
         self.requests: dict[int, RequestRecord] = {}
         self.current_request_id: int | None = None
 
         self._build_ui()
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
         self.reload()
 
     def _build_ui(self) -> None:
@@ -122,11 +159,14 @@ class PromptLibraryWindow:
         ttk.Button(source, text="txt取込", command=self.import_text).grid(
             row=0, column=5, padx=3
         )
-        ttk.Button(source, text="PromptSet JSON取込", command=self.import_prompt_set).grid(
+        ttk.Button(source, text="PromptSetを開く", command=self.open_prompt_set).grid(
             row=0, column=6, padx=3
         )
-        ttk.Button(source, text="RequestSet JSON取込", command=self.import_request_set).grid(
+        ttk.Button(source, text="PromptSetを追加", command=self.add_prompt_set).grid(
             row=0, column=7, padx=3
+        )
+        ttk.Button(source, text="RequestSet JSON取込", command=self.import_request_set).grid(
+            row=0, column=8, padx=3
         )
 
         self.notebook = ttk.Notebook(self.window)
@@ -261,8 +301,49 @@ class PromptLibraryWindow:
             row=6, column=1, columnspan=3, sticky="e", pady=(7, 0)
         )
 
+        promptset_frame = ttk.LabelFrame(
+            prompt_page, text="編集中のPromptSet JSON", padding=8
+        )
+        promptset_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        promptset_frame.columnconfigure(1, weight=1)
+        ttk.Label(promptset_frame, text="JSON").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            promptset_frame,
+            textvariable=self.promptset_source_var,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(
+            promptset_frame,
+            text="JSONへ上書き保存",
+            command=self.save_prompt_set_overwrite,
+        ).grid(row=0, column=2, padx=3)
+        ttk.Button(
+            promptset_frame,
+            text="名前を付けて保存",
+            command=self.save_prompt_set_as,
+        ).grid(row=0, column=3, padx=3)
+        ttk.Button(
+            promptset_frame,
+            text="配布用PromptSetを書き出し",
+            command=self.export_portable_prompt_set,
+        ).grid(row=0, column=4, padx=3)
+        ttk.Label(
+            promptset_frame,
+            text=(
+                "編集内容はSQLiteへ反映後、JSONへ保存してください。"
+                "配布用は適用済み設定を埋め込みます。"
+            ),
+            foreground="#555555",
+        ).grid(row=1, column=1, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        ttk.Checkbutton(
+            promptset_frame,
+            text="開いているPromptSetのみ表示",
+            variable=self.show_current_promptset_only_var,
+            command=self._refresh_prompt_tree,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
         rule_frame = ttk.LabelFrame(prompt_page, text="絵柄別Upscaler規則", padding=8)
-        rule_frame.grid(row=1, column=0, sticky="ew", pady=6)
+        rule_frame.grid(row=2, column=0, sticky="ew", pady=6)
         rule_frame.columnconfigure(1, weight=1)
         rule_frame.columnconfigure(3, weight=1)
         ttk.Label(rule_frame, text="絵柄").grid(row=0, column=0, sticky="w")
@@ -282,10 +363,10 @@ class PromptLibraryWindow:
         )
 
         footer = ttk.Frame(prompt_page, padding=(0, 4, 0, 4))
-        footer.grid(row=2, column=0, sticky="ew")
+        footer.grid(row=3, column=0, sticky="ew")
         ttk.Button(
             footer,
-            text="生成準備済み全件をバッチへ",
+            text="表示中の生成準備済みをバッチへ",
             command=self.load_all_ready,
         ).pack(side="right")
         ttk.Button(
@@ -487,6 +568,8 @@ class PromptLibraryWindow:
             filetypes=[("SQLite database", "*.sqlite3"), ("All files", "*.*")],
         )
         if path:
+            self.dirty_promptset_ids.clear()
+            self.current_promptset_collection_id = None
             self.database_path_var.set(path)
             self.reload()
 
@@ -507,6 +590,8 @@ class PromptLibraryWindow:
                 parent=self.window,
             )
             return
+        self.dirty_promptset_ids.clear()
+        self.current_promptset_collection_id = None
         self.database_path_var.set(path)
         self.reload()
 
@@ -519,6 +604,7 @@ class PromptLibraryWindow:
         try:
             self.library = PromptLibrary(Path(self.database_path_var.get()))
             catalog_style_names = self.library.sync_style_prompt_catalog()
+            collections = self.library.list_collections()
             records = self.library.list_jobs()
             rules = self.library.list_style_rules()
             request_records = self.library.list_requests()
@@ -526,24 +612,23 @@ class PromptLibraryWindow:
             messagebox.showerror("SQLiteライブラリ", str(error), parent=self.window)
             return
 
+        self.collections = {record.id: record for record in collections}
+        self.dirty_promptset_ids = {
+            record.id
+            for record in collections
+            if record.is_prompt_set and record.json_dirty
+        }
         self.jobs = {record.id: record for record in records}
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        for record in records:
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(record.id),
-                values=(
-                    record.id,
-                    record.collection_name,
-                    PROMPT_STATUS_LABELS.get(record.status, record.status),
-                    "✓" if record.enabled else "",
-                    record.title,
-                    record.style_key,
-                    record.effective_upscaler or "（共通）",
-                ),
-            )
+        if self.current_promptset_collection_id not in self.collections:
+            self.current_promptset_collection_id = None
+        if (
+            self.current_promptset_collection_id is None
+            and self.show_current_promptset_only_var.get()
+            and records
+        ):
+            newest_collection = self.collections.get(records[0].collection_id)
+            if newest_collection is not None and newest_collection.is_prompt_set:
+                self.current_promptset_collection_id = newest_collection.id
 
         discovered_style_names = (
             {record.style_key for record in records if record.style_key}
@@ -559,18 +644,54 @@ class PromptLibraryWindow:
         self.style_combo.configure(values=style_names)
         self.rule_style_combo.configure(values=style_names)
         self.request_style_combo.configure(values=style_names)
-        self.summary_var.set(f"{len(records)}件 / DB: {self.library.path.name}")
         if rules and not self.rule_style_var.get():
             self.rule_style_var.set(rules[0].style_key)
             self.rule_upscaler_var.set(rules[0].hr_upscaler)
-        if select_job_id is not None and str(select_job_id) in self.tree.get_children():
-            self.tree.selection_set(str(select_job_id))
-            self.tree.see(str(select_job_id))
-        elif records:
-            self.tree.selection_set(str(records[0].id))
+        self._refresh_prompt_tree(select_job_id=select_job_id)
+        self._refresh_promptset_source_label()
 
         self.requests = {record.id: record for record in request_records}
         self._refresh_request_tree(select_request_id=select_request_id)
+
+    def _refresh_prompt_tree(self, *, select_job_id: int | None = None) -> None:
+        visible_records = prompt_records_for_display(
+            list(self.jobs.values()),
+            current_collection_id=self.current_promptset_collection_id,
+            current_only=self.show_current_promptset_only_var.get(),
+        )
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for record in visible_records:
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(record.id),
+                values=(
+                    record.id,
+                    record.collection_name,
+                    PROMPT_STATUS_LABELS.get(record.status, record.status),
+                    "✓" if record.enabled else "",
+                    record.title,
+                    record.style_key,
+                    record.effective_upscaler or "（共通）",
+                ),
+            )
+        self.summary_var.set(
+            f"表示 {len(visible_records)} / 全{len(self.jobs)}件 / "
+            f"DB: {self.library.path.name}"
+        )
+        visible_ids = {record.id for record in visible_records}
+        target_id = select_job_id
+        if target_id not in visible_ids:
+            target_id = self.current_job_id
+        if target_id not in visible_ids:
+            target_id = visible_records[0].id if visible_records else None
+        if target_id is None:
+            self.current_job_id = None
+            return
+        self.tree.selection_set(str(target_id))
+        self.tree.see(str(target_id))
+        self._on_tree_select()
 
     def _refresh_request_tree(
         self, *, select_request_id: int | None = None
@@ -635,22 +756,70 @@ class PromptLibraryWindow:
         self.reload()
         messagebox.showinfo("txt取込", f"{count}件を取り込みました。", parent=self.window)
 
-    def import_prompt_set(self) -> None:
+    def open_prompt_set(self) -> None:
         path = filedialog.askopenfilename(
             parent=self.window,
-            title="PromptSet JSONを取り込む",
+            title="編集するPromptSet JSONを開く",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        if self.dirty_promptset_ids and not messagebox.askyesno(
+            "JSON未保存",
+            (
+                "JSONへ保存していない編集があります。\n"
+                "同じPromptSetを開く場合、その内容でSQLiteが更新されます。"
+                "続けますか？"
+            ),
+            parent=self.window,
+        ):
+            return
+        try:
+            result = self.library.open_prompt_set(path)
+        except Exception as error:
+            messagebox.showerror("PromptSetを開く", str(error), parent=self.window)
+            return
+        self.dirty_promptset_ids.discard(result.collection_id)
+        self.current_promptset_collection_id = result.collection_id
+        self.show_current_promptset_only_var.set(True)
+        job_ids = self.library.collection_job_ids(result.collection_id)
+        self.reload(select_job_id=job_ids[0] if job_ids else None)
+        self.notebook.select(1)
+        self._set_active_promptset(result.collection_id)
+        if result.created:
+            detail = f"{result.total}件を開きました。"
+        else:
+            detail = (
+                f"{result.total}件へ更新しました。\n"
+                f"追加 {result.added}件 / 更新 {result.updated}件 / 削除 {result.removed}件"
+            )
+        messagebox.showinfo(
+            "PromptSetを開く", detail, parent=self.window
+        )
+
+    def add_prompt_set(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.window,
+            title="PromptSet JSONを別セットとして追加",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if not path:
             return
         try:
-            _collection_id, count = self.library.import_prompt_set(path)
+            collection_id, count = self.library.import_prompt_set(path, as_copy=True)
         except Exception as error:
-            messagebox.showerror("PromptSet取込", str(error), parent=self.window)
+            messagebox.showerror("PromptSetを追加", str(error), parent=self.window)
             return
-        self.reload()
+        self.current_promptset_collection_id = collection_id
+        self.show_current_promptset_only_var.set(True)
+        job_ids = self.library.collection_job_ids(collection_id)
+        self.reload(select_job_id=job_ids[0] if job_ids else None)
+        self.notebook.select(1)
+        self._set_active_promptset(collection_id)
         messagebox.showinfo(
-            "PromptSet取込", f"{count}件を取り込みました。", parent=self.window
+            "PromptSetを追加",
+            f"{count}件を独立したセットとして追加しました。",
+            parent=self.window,
         )
 
     def import_request_set(self) -> None:
@@ -898,6 +1067,149 @@ class PromptLibraryWindow:
             parent=self.window,
         )
 
+    def _set_active_promptset(self, collection_id: int | None) -> None:
+        collection = self.collections.get(collection_id) if collection_id else None
+        if collection is None or not collection.is_prompt_set:
+            self.current_promptset_collection_id = None
+        else:
+            self.current_promptset_collection_id = collection.id
+        self._refresh_promptset_source_label()
+
+    def _refresh_promptset_source_label(self) -> None:
+        collection = self.collections.get(self.current_promptset_collection_id)
+        if collection is None or not collection.is_prompt_set:
+            self.promptset_source_var.set("PromptSetは選択されていません")
+            return
+        dirty = (
+            "  【JSON未保存の変更あり】"
+            if collection.id in self.dirty_promptset_ids
+            else ""
+        )
+        if collection.source_kind == "promptset-copy":
+            prefix = "追加コピー（上書き不可・別名保存してください）: "
+        else:
+            prefix = ""
+        self.promptset_source_var.set(f"{prefix}{collection.source_path}{dirty}")
+
+    def save_prompt_set_overwrite(self) -> bool:
+        collection = self.collections.get(self.current_promptset_collection_id)
+        if collection is None or not collection.is_prompt_set:
+            messagebox.showwarning(
+                "PromptSet保存",
+                "保存するPromptSetの項目を1件選択してください。",
+                parent=self.window,
+            )
+            return False
+        if not collection.is_writable_prompt_set:
+            messagebox.showinfo(
+                "PromptSet保存",
+                "追加したコピーは元JSONへ上書きしません。名前を付けて保存してください。",
+                parent=self.window,
+            )
+            return self.save_prompt_set_as()
+        try:
+            count = self.library.export_prompt_set(
+                collection.id,
+                collection.source_path,
+                portable=False,
+                relink=False,
+            )
+        except PromptLibraryError as error:
+            messagebox.showerror("PromptSet保存", str(error), parent=self.window)
+            return False
+        self.dirty_promptset_ids.discard(collection.id)
+        self._refresh_promptset_source_label()
+        messagebox.showinfo(
+            "PromptSet保存",
+            f"{count}件をJSONへ上書き保存しました。\n{collection.source_path}",
+            parent=self.window,
+        )
+        return True
+
+    def save_prompt_set_as(self) -> bool:
+        collection = self.collections.get(self.current_promptset_collection_id)
+        if collection is None or not collection.is_prompt_set:
+            messagebox.showwarning(
+                "PromptSet別名保存",
+                "保存するPromptSetの項目を1件選択してください。",
+                parent=self.window,
+            )
+            return False
+        source = Path(collection.source_path)
+        path = filedialog.asksaveasfilename(
+            parent=self.window,
+            title="PromptSet JSONを名前を付けて保存",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=str(source.parent) if source.parent.is_dir() else None,
+            initialfile=source.name or f"{collection.name}_PromptSet.json",
+        )
+        if not path:
+            return False
+        try:
+            count = self.library.export_prompt_set(
+                collection.id,
+                path,
+                portable=False,
+                relink=True,
+            )
+        except PromptLibraryError as error:
+            messagebox.showerror("PromptSet別名保存", str(error), parent=self.window)
+            return False
+        self.dirty_promptset_ids.discard(collection.id)
+        current_job_id = self.current_job_id
+        self.reload(select_job_id=current_job_id)
+        self._set_active_promptset(collection.id)
+        messagebox.showinfo(
+            "PromptSet別名保存",
+            f"{count}件を保存し、このJSONを編集対象にしました。\n{path}",
+            parent=self.window,
+        )
+        return True
+
+    def export_portable_prompt_set(self) -> None:
+        collection = self.collections.get(self.current_promptset_collection_id)
+        if collection is None or not collection.is_prompt_set:
+            messagebox.showwarning(
+                "配布用PromptSet",
+                "書き出すPromptSetの項目を1件選択してください。",
+                parent=self.window,
+            )
+            return
+        try:
+            DEFAULT_PROMPTSET_DISTRIBUTION_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        source = Path(collection.source_path)
+        path = filedialog.asksaveasfilename(
+            parent=self.window,
+            title="別PCへ配布するPromptSet JSONを書き出す",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=str(DEFAULT_PROMPTSET_DISTRIBUTION_DIR),
+            initialfile=source.name or f"{collection.name}_PromptSet.json",
+        )
+        if not path:
+            return
+        try:
+            count = self.library.export_prompt_set(
+                collection.id,
+                path,
+                portable=True,
+                relink=False,
+            )
+        except PromptLibraryError as error:
+            messagebox.showerror("配布用PromptSet", str(error), parent=self.window)
+            return
+        messagebox.showinfo(
+            "配布用PromptSet",
+            (
+                f"{count}件を配布用JSONへ書き出しました。\n{path}\n\n"
+                "別PCではこのJSONを「PromptSetを開く」で読み込んでください。"
+            ),
+            parent=self.window,
+        )
+
     def create_job(self) -> None:
         try:
             job_id = self.library.create_job()
@@ -905,6 +1217,12 @@ class PromptLibraryWindow:
             messagebox.showerror("新規作成", str(error), parent=self.window)
             return
         self.reload(select_job_id=job_id)
+        record = self.jobs.get(job_id)
+        if record and self.collections.get(record.collection_id, None):
+            collection = self.collections[record.collection_id]
+            if collection.is_prompt_set:
+                self.dirty_promptset_ids.add(collection.id)
+                self._set_active_promptset(collection.id)
 
     def delete_selected(self) -> None:
         ids = self._selected_ids()
@@ -917,11 +1235,19 @@ class PromptLibraryWindow:
             parent=self.window,
         ):
             return
+        changed_promptsets = {
+            self.jobs[job_id].collection_id
+            for job_id in ids
+            if job_id in self.jobs
+            and self.collections.get(self.jobs[job_id].collection_id)
+            and self.collections[self.jobs[job_id].collection_id].is_prompt_set
+        }
         try:
             deleted = self.library.delete_jobs(ids)
         except Exception as error:
             messagebox.showerror("選択削除", str(error), parent=self.window)
             return
+        self.dirty_promptset_ids.update(changed_promptsets)
         self.current_job_id = None
         self.reload()
         messagebox.showinfo(
@@ -958,16 +1284,25 @@ class PromptLibraryWindow:
                 "生成準備済みへ変更", str(error), parent=self.window
             )
             return
+        self.dirty_promptset_ids.update(
+            self.jobs[job_id].collection_id
+            for job_id in ids
+            if job_id in self.jobs
+            and self.collections.get(self.jobs[job_id].collection_id)
+            and self.collections[self.jobs[job_id].collection_id].is_prompt_set
+        )
         self.reload()
 
     def _on_tree_select(self, _event=None) -> None:
         ids = self._selected_ids()
         if len(ids) != 1:
+            self.current_job_id = None
             return
         record = self.jobs.get(ids[0])
         if record is None:
             return
         self.current_job_id = record.id
+        self._set_active_promptset(record.collection_id)
         self.title_var.set(record.title)
         self.style_var.set(record.style_key)
         self.status_var.set(PROMPT_STATUS_LABELS.get(record.status, record.status))
@@ -1009,7 +1344,11 @@ class PromptLibraryWindow:
         except PromptLibraryError as error:
             messagebox.showerror("保存", str(error), parent=self.window)
             return
+        collection = self.collections.get(record.collection_id)
+        if collection is not None and collection.is_prompt_set:
+            self.dirty_promptset_ids.add(collection.id)
         self.reload(select_job_id=self.current_job_id)
+        self._set_active_promptset(record.collection_id)
 
     def _on_rule_selected(self, _event=None) -> None:
         selected = self.rule_style_var.get().strip().casefold()
@@ -1044,15 +1383,15 @@ class PromptLibraryWindow:
         self._load_into_runner(ids)
 
     def load_all_ready(self) -> None:
-        ids = tuple(
-            record.id
-            for record in self.jobs.values()
-            if record.enabled and record.status == "ready"
+        visible_ids = tuple(int(item) for item in self.tree.get_children())
+        ids = ready_job_ids_for_display(
+            self.jobs,
+            visible_ids,
         )
         if not ids:
             messagebox.showwarning(
                 "バッチへ読込",
-                "有効な生成準備済み項目がありません。",
+                "表示中に有効な生成準備済み項目がありません。",
                 parent=self.window,
             )
             return
@@ -1067,7 +1406,35 @@ class PromptLibraryWindow:
                 "バッチへ読込", "選択項目はすべて生成対象外です。", parent=self.window
             )
             return
+        dirty_selected = {
+            self.jobs[job_id].collection_id
+            for job_id in enabled_ids
+            if job_id in self.jobs
+            and self.jobs[job_id].collection_id in self.dirty_promptset_ids
+        }
+        if dirty_selected and not messagebox.askyesno(
+            "JSON未保存",
+            (
+                "選択したPromptSetにJSON未保存の変更があります。\n"
+                "SQLiteの現在内容をバッチへ読み込みますか？"
+            ),
+            parent=self.window,
+        ):
+            return
         self.on_load(self.library.path, enabled_ids)
+        self.window.destroy()
+
+    def _on_close(self) -> None:
+        if self.dirty_promptset_ids and not messagebox.askyesno(
+            "JSON未保存",
+            (
+                f"{len(self.dirty_promptset_ids)}個のPromptSetに、"
+                "JSONへ保存していない変更があります。\n"
+                "SQLiteには保存されています。このまま閉じますか？"
+            ),
+            parent=self.window,
+        ):
+            return
         self.window.destroy()
 
     def _selected_ids(self) -> tuple[int, ...]:
