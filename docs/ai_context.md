@@ -168,6 +168,11 @@ Stable Diffusion WebUI 側は API 有効で起動する必要がある。
 - GUI からの長時間・大量ジョブ実行時の操作性確認。
 - 実機で `/sdapi/v1/progress` の進捗率・ETA表示を確認する。
 - 生成結果フォルダをGUIから開く導線を追加するか検討。
+- SQLiteプロンプトライブラリを実際の生成フローで使用し、一覧・編集・選択操作の改善点を洗い出す。
+- 依頼Inboxの候補抽出精度と、RequestSetを生成側へ渡す実運用を確認する。
+- 絵柄の表記揺れ（`mcp` / `むちぱ`、`bgk` / `絵柄bgk`など）を、ユーザー確認後に別名規則として追加する。
+- タイトル個別設定GUIは初期段階ではUpscalerのみ。生成枚数、解像度、Samplerなども個別編集するか実運用後に決める。
+- SQLite DB全体のバックアップ、画像生成完了状態の自動更新は今後検討する。
 
 次に確認すべきこと:
 
@@ -267,6 +272,12 @@ HTTP 500 from http://127.0.0.1:7860/sdapi/v1/txt2img:
   - CLI、payload 合成、Hires 互換補完。
 - `sd_webui_batch/gui.py`
   - GUI本体。
+- `sd_webui_batch/prompt_library.py`
+  - SQLiteスキーマ、依頼Inbox、RequestSet入出力、既存txt／PromptSet JSON取り込み、外部絵柄一覧同期、絵柄規則、タイトル個別設定の合成。
+- `sd_webui_batch/library_gui.py`
+  - 依頼Inboxと、SQLiteプロンプト一覧・編集・絵柄別Upscaler規則・バッチ選択画面。
+- `data_local/prompt_library.sqlite3`
+  - SQLite管理GUIが初回利用時に作成するローカルDB。Git管理対象外。
 - `examples/prompts.txt`
   - 動作確認用プロンプトファイル。ユーザーが変更している可能性があるため注意。
 - `examples/payload.json`
@@ -331,6 +342,29 @@ GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`
 - 次回セッションの AI エージェントがこのファイルを最初に読む前提で、簡潔かつ具体的に書くこと。
 
 ## 更新履歴
+
+- 2026-08-15
+  - 段階導入版のSQLiteプロンプトライブラリを追加。
+  - 従来の `・タイトル` txtを取り込み、タイトル・プロンプト・絵柄・状態・生成対象・個別UpscalerをGUIで編集可能にした。
+  - PromptSet JSON schema version 1の取り込みに対応した。
+  - 初期絵柄規則を `iwn / ata → Lanczos`、その他の同期対象絵柄 → `Latent (antialiased)` とした。GUIから変更可能。
+  - 設定合成を `共通Payload → 絵柄規則 → タイトル個別設定 → runner強制設定` の順にした。ネストした `override_settings` も再帰的に合成する。
+  - 既存GUIに `SQLite管理` ボタンを追加し、選択項目またはReady全件を既存のDry Run／生成処理へ渡せるようにした。
+  - `data_local/` を `.gitignore` へ追加した。
+  - `tests/test_prompt_library.py` を追加し、既存を含む57テスト成功、GUI非表示初期化、PromptSetサンプルの実取り込みとUpscaler解決を確認した。
+  - `sd-webui-prompt-codex-generate` 側は、従来txtと `YYYYMMDD_PromptSet.json` を併記する引き継ぎ仕様へ更新した。
+  - 同じSQLite DBへ `requests` テーブルと `依頼Inbox` タブを追加した。受取原文、取得元、参照、受取日時、キャラクター、絵柄、生成指示、状態、メモを管理できる。
+  - クリップボードからの依頼登録、保守的な候補抽出、手修正、複数選択の生成待ち化・削除、`YYYYMMDD_RequestSet.json` の入出力に対応した。
+  - PromptSetの任意 `source_request_id` で元依頼へ紐づけ、取り込み成功時に依頼状態を `prompt_generated` へ更新する。
+  - schema version 1 DBからの自動移行テストを追加。既存を含む61テスト成功、依頼Inboxを含むGUI非表示初期化を確認した。
+  - `sd-webui-prompt-codex-generate/0_SDXL Style Prompt.txt` の `●` 見出しを絵柄一覧として同期する処理を追加した。ノーマル／ヌルテカ以外は末尾の括弧内コードを表示名にし、既存Upscaler規則は上書きしない。
+  - 同期対象は `ノーマル / ヌルテカ / bgk / mcp / qwq / lil / kak / iwn / ata`。既存DBへ追加済みで、63テストとGUIプルダウン表示テストに成功した。
+  - 自由入力の絵柄コードが末尾にあると、その直前のほぼ全文をキャラクター候補にしていた問題を修正した。明示的なキャラ欄は維持し、自由入力では先頭語だけを候補にする。短い絵柄コードの部分一致誤検出も防止し、65テスト成功。
+  - 生成側の空欄規則を確定した。RequestSetの `characters` が空なら `__SDXL illustrious/vspo__,`、`style` が空なら `ノーマル` とし、原文から補完しない。キャラクター空欄時はタイトルにも推測名や `ぶいすぽ` を追加しない。
+  - 依頼Inboxへ状態フィルターと `選択を完了` を追加した。既定の `未完了` は `done` を除外し、受付／確認済み／プロンプト生成待ち／プロンプト生成済み／完了／すべてへ切り替えられる。
+  - Upscalerの既定規則を `iwn / ata → Lanczos`、その他の現行絵柄 → `Latent (antialiased)` へ更新した。旧既定値または空の規則だけを一度移行し、別の個別設定は保持する。
+  - 依頼状態とプロンプト状態のGUI表示、状態選択、関連ボタンを日本語化した。DB内部値は互換性維持のため変更していない。67テストとGUIでの完了非表示・再表示テストに成功した。
+  - RequestSet書き出し順を依頼IDの昇順に固定した。依頼Inboxの新しい順表示やGUIの選択順に影響されず、今後の生成順はID 1→Nとなる。既存を含む68テスト成功。
 
 - 2026-05-12
   - 初版作成。
