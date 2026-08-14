@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 from sd_webui_batch.cli import build_arg_parser, build_payload, load_payload_json
 from sd_webui_batch.parser import PromptJob
@@ -25,6 +26,26 @@ class CliPayloadTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     parser.parse_args(["prompts.txt", "--chunk-size", invalid])
+
+    def test_dynamic_prompt_defaults_can_come_from_environment(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "SD_WEBUI_DYNAMIC_PROMPTS": "1",
+                "SD_WEBUI_WILDCARDS": str(Path("wildcards")),
+                "SD_WEBUI_MANIFEST_DIR": str(Path("manifests")),
+            },
+            clear=False,
+        ):
+            args = build_arg_parser().parse_args(["prompts.txt"])
+            disabled_args = build_arg_parser().parse_args(
+                ["prompts.txt", "--no-expand-dynamic-prompts"]
+            )
+
+        self.assertTrue(args.expand_dynamic_prompts)
+        self.assertFalse(disabled_args.expand_dynamic_prompts)
+        self.assertEqual(args.wildcards_dir, [Path("wildcards")])
+        self.assertEqual(args.manifest_dir, Path("manifests"))
 
     def test_uses_payload_n_iter_when_batch_count_is_omitted(self):
         args = build_arg_parser().parse_args(["prompts.txt"])
@@ -81,7 +102,19 @@ class CliPayloadTests(unittest.TestCase):
         payload = build_payload(job, args, {"enable_hr": True, "cfg_scale": 5.5})
 
         self.assertEqual(payload["hr_cfg_scale"], 5.5)
+        self.assertEqual(payload["hr_cfg"], 5.5)
         self.assertEqual(payload["hr_rescale_cfg"], 0.0)
+        self.assertEqual(payload["hr_additional_modules"], [])
+
+    def test_forge_neo_hires_cfg_is_preserved_for_classic_compatibility(self):
+        args = build_arg_parser().parse_args(["prompts.txt"])
+        job = PromptJob(index=1, title="title", prompt="AAAA,", line_number=1)
+
+        payload = build_payload(job, args, {"enable_hr": True, "hr_cfg": 4.5})
+
+        self.assertEqual(payload["hr_cfg"], 4.5)
+        self.assertEqual(payload["hr_cfg_scale"], 4.5)
+
 
     def test_always_disables_grid_creation_without_losing_other_overrides(self):
         args = build_arg_parser().parse_args(["prompts.txt"])

@@ -15,7 +15,14 @@ from .batching import (
     split_payload_into_chunks,
 )
 from .client import SdWebuiApiError, SdWebuiClient, SdWebuiTransportError
+from .dynamic_prompts import (
+    DynamicPromptError,
+    DynamicPromptExpander,
+    plan_dynamic_prompt_chunks,
+    write_dynamic_manifest,
+)
 from .parser import PromptJob, PromptParseError, parse_prompt_note, read_text_file
+from .prompt_library import merge_payload_overrides
 
 
 INVALID_WINDOWS_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -42,16 +49,47 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{job.index}] {job.title} -> {subdir}")
 
     try:
-        job_chunks = [
-            split_payload_into_chunks(
-                build_payload(job, args, base_payload),
-                max_images_per_request=args.chunk_size,
-            )
-            for job in jobs
-        ]
-    except ValueError as error:
+        expander = (
+            DynamicPromptExpander(args.wildcards_dir)
+            if args.expand_dynamic_prompts
+            else None
+        )
+        dynamic_records: list[dict[str, Any]] = []
+        job_chunks: list[tuple[BatchChunk, ...]] = []
+        for job in jobs:
+            payload = build_payload(job, args, base_payload)
+            if expander is None:
+                chunks = split_payload_into_chunks(
+                    payload,
+                    max_images_per_request=args.chunk_size,
+                )
+            else:
+                chunks, records = plan_dynamic_prompt_chunks(
+                    payload,
+                    expander,
+                    job_index=job.index,
+                    job_title=job.title,
+                )
+                dynamic_records.extend(records)
+            job_chunks.append(chunks)
+    except (DynamicPromptError, ValueError) as error:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
+
+    if expander is not None:
+        manifest_dir = args.manifest_dir or args.prompt_file.parent / "manifests"
+        manifest_path = write_dynamic_manifest(
+            manifest_dir,
+            dynamic_records,
+            metadata={
+                "webui_url": args.url,
+                "prompt_file": str(args.prompt_file.resolve()),
+                "payload_file": str(args.payload_json.resolve()) if args.payload_json else None,
+                "wildcard_directories": [str(path) for path in expander.directories],
+                "base_payload": base_payload,
+            },
+        )
+        print(f"Dynamic prompt manifest: {manifest_path}")
 
     if args.dry_run:
         print("\nDry run request plan (no API calls will be made):")
@@ -137,6 +175,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--payload-json",
         type=Path,
         help="Optional JSON file with base txt2img settings. CLI/job values override it.",
+    )
+    dynamic_default = os.environ.get("SD_WEBUI_DYNAMIC_PROMPTS", "").casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    wildcard_default = [
+        Path(value)
+        for value in os.environ.get("SD_WEBUI_WILDCARDS", "").split(os.pathsep)
+        if value.strip()
+    ]
+    parser.add_argument(
+        "--expand-dynamic-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=dynamic_default,
+        help=(
+            "Resolve {a|b} and __wildcard__ syntax in the runner. Each output is sent "
+            "as an individual B=1 request and recorded in a manifest."
+        ),
+    )
+    parser.add_argument(
+        "--wildcards-dir",
+        type=Path,
+        action="append",
+        default=wildcard_default,
+        help="Wildcard text directory. May be supplied more than once.",
+    )
+    parser.add_argument(
+        "--manifest-dir",
+        type=Path,
+        default=(
+            Path(os.environ["SD_WEBUI_MANIFEST_DIR"])
+            if os.environ.get("SD_WEBUI_MANIFEST_DIR")
+            else None
+        ),
+        help="Directory for resolved Dynamic Prompts manifests.",
     )
     parser.add_argument(
         "--batch-count",
@@ -229,7 +304,7 @@ def load_payload_json(path: Path | None) -> dict[str, Any]:
 
 
 def build_payload(job: PromptJob, args: argparse.Namespace, base_payload: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(base_payload)
+    payload = merge_payload_overrides(base_payload, job.settings_override)
     payload["prompt"] = job.prompt
 
     if args.batch_count is not None:
@@ -289,10 +364,19 @@ def apply_hires_compatibility_defaults(payload: dict[str, Any]) -> None:
     if not payload.get("enable_hr"):
         return
 
-    # Forge/reForge variants expose these Hires fields through the API schema
-    # without usable defaults. Supplying numbers avoids None reaching math code.
-    payload.setdefault("hr_cfg_scale", payload.get("cfg_scale", 7.0))
+    # Classic/reForge use hr_cfg_scale while Forge Neo uses hr_cfg. Keep both
+    # so the same payload profile remains valid against either API.
+    hires_cfg = payload.get(
+        "hr_cfg",
+        payload.get("hr_cfg_scale", payload.get("cfg_scale", 7.0)),
+    )
+    payload.setdefault("hr_cfg_scale", hires_cfg)
+    payload.setdefault("hr_cfg", hires_cfg)
     payload.setdefault("hr_rescale_cfg", 0.0)
+
+    # Forge Neo 2.28 iterates this value during Hires processing. Its API
+    # schema currently supplies None when the field is omitted.
+    payload.setdefault("hr_additional_modules", [])
 
 
 def strip_comment_fields(value: Any) -> Any:

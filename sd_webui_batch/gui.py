@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import queue
 from types import SimpleNamespace
@@ -17,7 +18,14 @@ from .batching import (
 )
 from .cli import build_payload, strip_comment_fields
 from .client import SdWebuiApiError, SdWebuiClient, SdWebuiTransportError
+from .dynamic_prompts import (
+    DynamicPromptError,
+    DynamicPromptExpander,
+    plan_dynamic_prompt_chunks,
+    write_dynamic_manifest,
+)
 from .parser import PromptJob, PromptParseError, parse_prompt_note, read_text_file
+from .prompt_library import DEFAULT_DATABASE_PATH, PromptLibrary
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -45,13 +53,35 @@ class BatchRunnerApp:
         self.active_run_id = 0
         self.generation_running = False
         self.webui_controls_enabled = False
+        self.settings_loaded = False
+        self.library_selection: tuple[Path, tuple[int, ...]] | None = None
 
         self.prompt_path_var = tk.StringVar(value=str(PROJECT_ROOT / "examples" / "prompts.txt"))
-        self.payload_path_var = tk.StringVar(value=str(PROJECT_ROOT / "examples" / "payload.json"))
-        self.url_var = tk.StringVar(value="http://127.0.0.1:7860")
+        self.payload_path_var = tk.StringVar(
+            value=os.environ.get(
+                "SD_WEBUI_PAYLOAD",
+                str(PROJECT_ROOT / "examples" / "payload.json"),
+            )
+        )
+        self.url_var = tk.StringVar(
+            value=os.environ.get("SD_WEBUI_URL", "http://127.0.0.1:7860")
+        )
         self.timeout_var = tk.StringVar(value="86400")
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
+        self.dynamic_prompts_var = tk.BooleanVar(
+            value=os.environ.get("SD_WEBUI_DYNAMIC_PROMPTS", "").casefold()
+            in {"1", "true", "yes", "on"}
+        )
+        self.wildcards_dir_var = tk.StringVar(
+            value=os.environ.get("SD_WEBUI_WILDCARDS", "")
+        )
+        self.manifest_dir_var = tk.StringVar(
+            value=os.environ.get(
+                "SD_WEBUI_MANIFEST_DIR",
+                str(PROJECT_ROOT / "manifests"),
+            )
+        )
 
         self.n_iter_var = tk.StringVar(value="1")
         self.batch_size_var = tk.StringVar(value="1")
@@ -87,11 +117,13 @@ class BatchRunnerApp:
         self.job_count_var = tk.StringVar(value="ジョブ未読み込み")
 
         self._build_ui()
-        self.n_iter_var.trace_add("write", lambda *_: self._update_job_tree(self.jobs))
-        self.batch_size_var.trace_add("write", lambda *_: self._update_job_tree(self.jobs))
+        self.n_iter_var.trace_add("write", self._on_plan_setting_changed)
+        self.batch_size_var.trace_add("write", self._on_plan_setting_changed)
         self.sanitize_subdir_var.trace_add("write", lambda *_: self._update_job_tree(self.jobs))
+        self.dynamic_prompts_var.trace_add("write", self._on_plan_setting_changed)
         self._load_payload_if_present()
         self.refresh_jobs(show_errors=False)
+        self.settings_loaded = True
         self.root.after(100, self._drain_events)
 
     def _build_ui(self) -> None:
@@ -136,7 +168,33 @@ class BatchRunnerApp:
         ttk.Entry(frame, textvariable=self.username_var).grid(row=2, column=1, sticky="ew", padx=4)
         ttk.Label(frame, text="Password").grid(row=2, column=2, sticky="e", padx=4)
         ttk.Entry(frame, show="*", textvariable=self.password_var).grid(row=2, column=3, sticky="ew", padx=4)
-        ttk.Label(frame, textvariable=self.job_count_var).grid(row=2, column=4, columnspan=2, sticky="w", padx=(14, 4))
+        ttk.Label(frame, textvariable=self.job_count_var).grid(row=2, column=4, sticky="w", padx=(14, 4))
+        ttk.Button(frame, text="SQLite管理", command=self.open_prompt_library).grid(
+            row=2, column=5, padx=4
+        )
+
+        ttk.Checkbutton(
+            frame,
+            text="Runner Dynamic Prompts (per image / B=1)",
+            variable=self.dynamic_prompts_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(frame, text="Wildcards").grid(row=3, column=2, sticky="e", padx=4)
+        ttk.Entry(frame, textvariable=self.wildcards_dir_var).grid(
+            row=3, column=3, columnspan=2, sticky="ew", padx=4
+        )
+        ttk.Button(frame, text="Select", command=self.browse_wildcards).grid(
+            row=3, column=5, padx=4
+        )
+
+        ttk.Label(frame, text="Manifest directory").grid(
+            row=4, column=0, sticky="w", padx=8, pady=6
+        )
+        ttk.Entry(frame, textvariable=self.manifest_dir_var).grid(
+            row=4, column=1, columnspan=4, sticky="ew", padx=4
+        )
+        ttk.Button(frame, text="Select", command=self.browse_manifest_dir).grid(
+            row=4, column=5, padx=4
+        )
 
     def _build_settings_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="生成設定")
@@ -231,15 +289,19 @@ class BatchRunnerApp:
         frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         frame.columnconfigure(0, weight=1)
 
-        columns = ("index", "title", "images", "requests", "subdir")
+        columns = ("index", "title", "style", "upscaler", "images", "requests", "subdir")
         self.job_tree = ttk.Treeview(frame, columns=columns, show="headings", height=7)
         self.job_tree.heading("index", text="#")
         self.job_tree.heading("title", text="タイトル")
+        self.job_tree.heading("style", text="絵柄")
+        self.job_tree.heading("upscaler", text="適用Upscaler")
         self.job_tree.heading("images", text="総画像数")
         self.job_tree.heading("requests", text="送信回数")
         self.job_tree.heading("subdir", text="Subdirectory override")
         self.job_tree.column("index", width=50, anchor="center", stretch=False)
-        self.job_tree.column("title", width=320)
+        self.job_tree.column("title", width=260)
+        self.job_tree.column("style", width=85, anchor="center", stretch=False)
+        self.job_tree.column("upscaler", width=150, stretch=False)
         self.job_tree.column("images", width=90, anchor="center", stretch=False)
         self.job_tree.column("requests", width=80, anchor="center", stretch=False)
         self.job_tree.column("subdir", width=340)
@@ -276,8 +338,31 @@ class BatchRunnerApp:
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
         )
         if path:
+            self.library_selection = None
             self.prompt_path_var.set(path)
             self.refresh_jobs()
+
+    def open_prompt_library(self) -> None:
+        from .library_gui import PromptLibraryWindow
+
+        current_path = (
+            self.library_selection[0]
+            if self.library_selection is not None
+            else DEFAULT_DATABASE_PATH
+        )
+        PromptLibraryWindow(
+            self.root,
+            database_path=current_path,
+            on_load=self._load_library_selection,
+        )
+
+    def _load_library_selection(
+        self, database_path: Path, job_ids: tuple[int, ...]
+    ) -> None:
+        self.library_selection = (database_path, job_ids)
+        self.prompt_path_var.set(str(database_path))
+        self.refresh_jobs(show_errors=True)
+        self.status_var.set("SQLiteライブラリから読込済み：Dry Runで確認してください")
 
     def browse_payload(self) -> None:
         path = filedialog.askopenfilename(
@@ -287,6 +372,16 @@ class BatchRunnerApp:
         if path:
             self.payload_path_var.set(path)
             self.load_payload()
+
+    def browse_wildcards(self) -> None:
+        path = filedialog.askdirectory(title="Select wildcard directory")
+        if path:
+            self.wildcards_dir_var.set(path)
+
+    def browse_manifest_dir(self) -> None:
+        path = filedialog.askdirectory(title="Select manifest directory")
+        if path:
+            self.manifest_dir_var.set(path)
 
     def _load_payload_if_present(self) -> None:
         if Path(self.payload_path_var.get()).exists():
@@ -334,10 +429,16 @@ class BatchRunnerApp:
         self._append_log(f"Saved payload: {path}")
 
     def refresh_jobs(self, show_errors: bool = True) -> None:
-        path = Path(self.prompt_path_var.get())
         try:
-            text = read_text_file(path)
-            jobs = parse_prompt_note(text)
+            if self.library_selection is not None:
+                database_path, job_ids = self.library_selection
+                jobs = PromptLibrary(database_path).load_generation_jobs(job_ids)
+                if not jobs:
+                    raise PromptParseError("SQLiteライブラリの選択項目がありません。")
+            else:
+                path = Path(self.prompt_path_var.get())
+                text = read_text_file(path)
+                jobs = parse_prompt_note(text)
         except Exception as error:
             self.jobs = []
             self._update_job_tree([])
@@ -348,7 +449,8 @@ class BatchRunnerApp:
 
         self.jobs = jobs
         self._update_job_tree(jobs)
-        self.job_count_var.set(f"{len(jobs)} job(s) loaded")
+        source_label = "SQLite" if self.library_selection is not None else "txt"
+        self.job_count_var.set(f"{len(jobs)} job(s) loaded / {source_label}")
 
     def _update_job_tree(self, jobs: list[PromptJob]) -> None:
         for item in self.job_tree.get_children():
@@ -357,25 +459,36 @@ class BatchRunnerApp:
         n_iter = self._safe_int(self.n_iter_var.get(), default=1)
         batch_size = self._safe_int(self.batch_size_var.get(), default=1)
         try:
-            chunks = split_payload_into_chunks(
-                {"n_iter": n_iter, "batch_size": batch_size},
-                max_images_per_request=DEFAULT_MAX_IMAGES_PER_REQUEST,
-                resolve_random_seeds=False,
+            total_images, request_count = calculate_job_plan_counts(
+                n_iter,
+                batch_size,
+                dynamic_prompts=self.dynamic_prompts_var.get(),
             )
         except ValueError:
             total_images: int | str = "-"
             request_count: int | str = "-"
-        else:
-            total_images = chunks[0].total_images
-            request_count = len(chunks)
         sanitize = self.sanitize_subdir_var.get()
         for job in jobs:
             subdir = job.subdirectory if not sanitize else self._sanitize_preview(job.subdirectory)
+            upscaler = str(job.settings_override.get("hr_upscaler", ""))
             self.job_tree.insert(
                 "",
                 "end",
-                values=(job.index, job.title, total_images, request_count, subdir),
+                values=(
+                    job.index,
+                    job.title,
+                    job.style_key,
+                    upscaler or "（共通）",
+                    total_images,
+                    request_count,
+                    subdir,
+                ),
             )
+
+    def _on_plan_setting_changed(self, *_args: Any) -> None:
+        self._update_job_tree(self.jobs)
+        if self.settings_loaded and not (self.worker and self.worker.is_alive()):
+            self.status_var.set("設定変更済み：Dry Runを再実行")
 
     def _populate_form(self, payload: dict[str, Any]) -> None:
         self.n_iter_var.set(str(payload.get("n_iter", 1)))
@@ -495,16 +608,50 @@ class BatchRunnerApp:
             jobs = self._selected_jobs()
             base_payload = self._collect_base_payload()
             args = self._build_cli_args()
-            job_plans = [
-                (
-                    job,
-                    split_payload_into_chunks(
-                        build_payload(job, args, base_payload),
+            expander = None
+            if self.dynamic_prompts_var.get():
+                wildcard_directories = [
+                    Path(value)
+                    for value in self.wildcards_dir_var.get().split(os.pathsep)
+                    if value.strip()
+                ]
+                expander = DynamicPromptExpander(wildcard_directories)
+
+            dynamic_records: list[dict[str, Any]] = []
+            job_plans: list[tuple[PromptJob, tuple[BatchChunk, ...]]] = []
+            for job in jobs:
+                payload = build_payload(job, args, base_payload)
+                if expander is None:
+                    chunks = split_payload_into_chunks(
+                        payload,
                         max_images_per_request=DEFAULT_MAX_IMAGES_PER_REQUEST,
-                    ),
+                    )
+                else:
+                    chunks, records = plan_dynamic_prompt_chunks(
+                        payload,
+                        expander,
+                        job_index=job.index,
+                        job_title=job.title,
+                    )
+                    dynamic_records.extend(records)
+                job_plans.append((job, chunks))
+
+            manifest_path = None
+            if expander is not None:
+                manifest_directory = self.manifest_dir_var.get().strip()
+                if not manifest_directory:
+                    raise DynamicPromptError("Manifest directory is required.")
+                manifest_path = write_dynamic_manifest(
+                    manifest_directory,
+                    dynamic_records,
+                    metadata={
+                        "webui_url": self.url_var.get().strip(),
+                        "prompt_file": str(Path(self.prompt_path_var.get()).resolve()),
+                        "payload_file": str(Path(self.payload_path_var.get()).resolve()),
+                        "wildcard_directories": [str(path) for path in expander.directories],
+                        "base_payload": base_payload,
+                    },
                 )
-                for job in jobs
-            ]
             timeout = self._parse_timeout()
             client_options = {
                 "base_url": self.url_var.get().strip(),
@@ -513,7 +660,7 @@ class BatchRunnerApp:
                 "password": self.password_var.get() or None,
             }
             stop_on_error = self.stop_on_error_var.get()
-        except (ValueError, PromptParseError) as error:
+        except (DynamicPromptError, ValueError, PromptParseError) as error:
             messagebox.showerror("設定エラー", str(error))
             return
 
@@ -536,9 +683,12 @@ class BatchRunnerApp:
             f"{total_requests} request(s)"
         )
         self._append_log(
-            f"Each request is limited to {DEFAULT_MAX_IMAGES_PER_REQUEST} image(s); "
+            f"Each request is limited to "
+            f"{1 if expander is not None else DEFAULT_MAX_IMAGES_PER_REQUEST} image(s); "
             "grid creation is disabled."
         )
+        if manifest_path is not None:
+            self._append_log(f"Dynamic prompt manifest: {manifest_path}")
 
         self.worker = threading.Thread(
             target=self._run_jobs,
@@ -1110,6 +1260,32 @@ class BatchRunnerApp:
         from .cli import sanitize_subdirectory
 
         return sanitize_subdirectory(value)
+
+
+def calculate_job_plan_counts(
+    n_iter: int,
+    batch_size: int,
+    *,
+    dynamic_prompts: bool,
+) -> tuple[int, int]:
+    """Return per-job image and API request counts for the GUI preview."""
+
+    if isinstance(n_iter, bool) or not isinstance(n_iter, int) or n_iter <= 0:
+        raise ValueError("n_iter must be a positive integer")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
+    total_images = n_iter * batch_size
+    if dynamic_prompts:
+        # Runner-side expansion converts every output into its own B=1 request.
+        return total_images, total_images
+
+    chunks = split_payload_into_chunks(
+        {"n_iter": n_iter, "batch_size": batch_size},
+        max_images_per_request=DEFAULT_MAX_IMAGES_PER_REQUEST,
+        resolve_random_seeds=False,
+    )
+    return total_images, len(chunks)
 
 
 def normalize_webui_progress(value: Any) -> float | None:

@@ -2,14 +2,65 @@ import math
 import unittest
 
 from sd_webui_batch.gui import (
+    calculate_job_plan_counts,
     format_eta,
     format_progress_status,
     normalize_eta,
     normalize_webui_progress,
 )
+from sd_webui_batch.library_gui import (
+    PROMPT_STATUS_LABELS,
+    PROMPT_STATUS_VALUES,
+    REQUEST_FILTER_CHOICES,
+    REQUEST_STATUS_LABELS,
+    REQUEST_STATUS_VALUES,
+    request_status_matches_filter,
+)
+from sd_webui_batch.prompt_library import REQUEST_STATUSES
 
 
 class GuiProgressHelperTests(unittest.TestCase):
+    def test_library_statuses_have_reversible_japanese_labels(self):
+        self.assertEqual(set(REQUEST_STATUS_LABELS), set(REQUEST_STATUSES))
+        self.assertEqual(
+            {
+                REQUEST_STATUS_VALUES[label]
+                for label in REQUEST_STATUS_LABELS.values()
+            },
+            set(REQUEST_STATUSES),
+        )
+        self.assertEqual(PROMPT_STATUS_VALUES["下書き"], "draft")
+        self.assertEqual(PROMPT_STATUS_VALUES["生成準備済み"], "ready")
+        self.assertEqual(PROMPT_STATUS_VALUES["生成済み"], "generated")
+        self.assertEqual(set(PROMPT_STATUS_LABELS), {"draft", "ready", "generated"})
+
+    def test_request_status_filter_hides_completed_by_default(self):
+        self.assertEqual(REQUEST_FILTER_CHOICES[0], "未完了")
+        self.assertTrue(request_status_matches_filter("received", "未完了"))
+        self.assertTrue(
+            request_status_matches_filter("prompt_generated", "未完了")
+        )
+        self.assertFalse(request_status_matches_filter("done", "未完了"))
+        self.assertTrue(request_status_matches_filter("done", "完了"))
+        self.assertFalse(request_status_matches_filter("received", "完了"))
+        self.assertTrue(request_status_matches_filter("done", "すべて"))
+
+    def test_dynamic_preview_counts_each_output_as_a_b1_request(self):
+        self.assertEqual(
+            calculate_job_plan_counts(1, 2, dynamic_prompts=True),
+            (2, 2),
+        )
+        self.assertEqual(
+            calculate_job_plan_counts(3, 4, dynamic_prompts=True),
+            (12, 12),
+        )
+
+    def test_regular_preview_keeps_gpu_batching(self):
+        self.assertEqual(
+            calculate_job_plan_counts(50, 2, dynamic_prompts=False),
+            (100, 1),
+        )
+
     def test_normalizes_progress_without_allowing_invalid_values(self):
         self.assertEqual(normalize_webui_progress(-0.2), 0.0)
         self.assertEqual(normalize_webui_progress(1.2), 1.0)

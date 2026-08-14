@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from pathlib import Path
+from typing import Any
 
 
 TITLE_PATTERN = re.compile(r"^\s*・(?P<title>.+?)\s*$")
@@ -18,6 +19,9 @@ class PromptJob:
     title: str
     prompt: str
     line_number: int
+    style_key: str = ""
+    settings_override: dict[str, Any] = field(default_factory=dict)
+    source_id: int | None = None
 
     @property
     def subdirectory(self) -> str:
@@ -71,6 +75,7 @@ def parse_prompt_note(text: str) -> list[PromptJob]:
                 title=current_title,
                 prompt=prompt,
                 line_number=current_line_number,
+                style_key=extract_style_key(current_title),
             )
         )
         current_title = None
@@ -109,3 +114,12 @@ def _normalize_prompt_lines(lines: list[str]) -> str:
         cleaned.pop()
 
     return "\n".join(cleaned).strip()
+
+
+def extract_style_key(title: str) -> str:
+    """Return the final full-width-colon suffix used as the prompt style."""
+
+    _separator, found, suffix = title.rpartition("：")
+    if not found:
+        return ""
+    return suffix.strip()
