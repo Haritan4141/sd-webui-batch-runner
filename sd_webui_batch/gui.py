@@ -30,6 +30,36 @@ from .prompt_library import DEFAULT_DATABASE_PATH, PromptLibrary
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROGRESS_POLL_INTERVAL_SECONDS = 1.0
+EVENT_DRAIN_BATCH_SIZE = 50
+DRY_RUN_REQUEST_DETAIL_LIMIT = 12
+
+
+def format_dry_run_request_lines(
+    chunks: tuple[BatchChunk, ...],
+    *,
+    detail_limit: int = DRY_RUN_REQUEST_DETAIL_LIMIT,
+) -> list[str]:
+    """Format a bounded request preview so a large Dry Run stays responsive."""
+
+    def describe(chunk: BatchChunk) -> str:
+        return (
+            f"request {chunk.ordinal}/{chunk.total_chunks}: images "
+            f"{chunk.image_start}-{chunk.image_end}/{chunk.total_images}, "
+            f"n_iter={chunk.payload['n_iter']}, "
+            f"seed={chunk.payload.get('seed', 'default')}"
+        )
+
+    if detail_limit < 2 or len(chunks) <= detail_limit:
+        return [describe(chunk) for chunk in chunks]
+
+    first_count = detail_limit // 2
+    last_count = detail_limit - first_count
+    omitted = len(chunks) - first_count - last_count
+    return [
+        *(describe(chunk) for chunk in chunks[:first_count]),
+        f"... {omitted} request(s) omitted from the GUI log ...",
+        *(describe(chunk) for chunk in chunks[-last_count:]),
+    ]
 
 
 class BatchRunnerApp:
@@ -53,6 +83,7 @@ class BatchRunnerApp:
         self.active_run_id = 0
         self.generation_running = False
         self.webui_controls_enabled = False
+        self.run_preparing = False
         self.settings_loaded = False
         self.library_selection: tuple[Path, tuple[int, ...]] | None = None
 
@@ -608,18 +639,100 @@ class BatchRunnerApp:
             jobs = self._selected_jobs()
             base_payload = self._collect_base_payload()
             args = self._build_cli_args()
-            expander = None
-            if self.dynamic_prompts_var.get():
-                wildcard_directories = [
+            dynamic_prompts = self.dynamic_prompts_var.get()
+            wildcard_directories: tuple[Path, ...] = ()
+            if dynamic_prompts:
+                wildcard_directories = tuple(
                     Path(value)
                     for value in self.wildcards_dir_var.get().split(os.pathsep)
                     if value.strip()
-                ]
-                expander = DynamicPromptExpander(wildcard_directories)
+                )
+            manifest_directory = self.manifest_dir_var.get().strip()
+            if dynamic_prompts and not manifest_directory:
+                raise DynamicPromptError("Manifest directory is required.")
+            timeout = self._parse_timeout()
+            client_options = {
+                "base_url": self.url_var.get().strip(),
+                "timeout": timeout,
+                "username": self.username_var.get().strip() or None,
+                "password": self.password_var.get() or None,
+            }
+            stop_on_error = self.stop_on_error_var.get()
+            manifest_metadata = {
+                "webui_url": self.url_var.get().strip(),
+                "prompt_file": str(Path(self.prompt_path_var.get()).resolve()),
+                "payload_file": str(Path(self.payload_path_var.get()).resolve()),
+                "wildcard_directories": [str(path) for path in wildcard_directories],
+                "base_payload": base_payload,
+            }
+        except (DynamicPromptError, ValueError, PromptParseError) as error:
+            messagebox.showerror("設定エラー", str(error))
+            return
 
+        self.stop_after_current.clear()
+        self.interrupt_requested.clear()
+        self.skip_requested.clear()
+        self.progress_poll_warning_sent.clear()
+        self.active_run_id += 1
+        run_id = self.active_run_id
+        self.progress.configure(maximum=max(len(jobs), 1), value=0)
+        self.status_var.set(f"準備中: 0/{len(jobs)}ジョブ")
+        self.webui_controls_enabled = False
+        self.run_preparing = True
+        self._set_running(True)
+        self._clear_log()
+        mode = "dry-run" if dry_run else "generation"
+        self._append_log(f"Preparing {mode}: {len(jobs)} job(s)")
+
+        self.worker = threading.Thread(
+            target=self._prepare_and_run_jobs,
+            args=(
+                run_id,
+                jobs,
+                base_payload,
+                args,
+                dynamic_prompts,
+                wildcard_directories,
+                manifest_directory,
+                manifest_metadata,
+                client_options,
+                stop_on_error,
+                dry_run,
+            ),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _prepare_and_run_jobs(
+        self,
+        run_id: int,
+        jobs: list[PromptJob],
+        base_payload: dict[str, Any],
+        args: SimpleNamespace,
+        dynamic_prompts: bool,
+        wildcard_directories: tuple[Path, ...],
+        manifest_directory: str,
+        manifest_metadata: dict[str, Any],
+        client_options: dict[str, Any],
+        stop_on_error: bool,
+        dry_run: bool,
+    ) -> None:
+        try:
+            expander = (
+                DynamicPromptExpander(wildcard_directories)
+                if dynamic_prompts
+                else None
+            )
             dynamic_records: list[dict[str, Any]] = []
             job_plans: list[tuple[PromptJob, tuple[BatchChunk, ...]]] = []
-            for job in jobs:
+            total_images = 0
+            total_requests = 0
+
+            for number, job in enumerate(jobs, start=1):
+                if self.stop_after_current.is_set():
+                    self.events.put(("prepare_cancelled", {"run_id": run_id}))
+                    return
+
                 payload = build_payload(job, args, base_payload)
                 if expander is None:
                     chunks = split_payload_into_chunks(
@@ -635,67 +748,68 @@ class BatchRunnerApp:
                     )
                     dynamic_records.extend(records)
                 job_plans.append((job, chunks))
+                total_images += sum(chunk.image_count for chunk in chunks)
+                total_requests += len(chunks)
+                self.events.put(
+                    (
+                        "planning_progress",
+                        {
+                            "run_id": run_id,
+                            "job_number": number,
+                            "job_total": len(jobs),
+                            "total_images": total_images,
+                            "total_requests": total_requests,
+                        },
+                    )
+                )
+
+            if self.stop_after_current.is_set():
+                self.events.put(("prepare_cancelled", {"run_id": run_id}))
+                return
 
             manifest_path = None
             if expander is not None:
-                manifest_directory = self.manifest_dir_var.get().strip()
-                if not manifest_directory:
-                    raise DynamicPromptError("Manifest directory is required.")
                 manifest_path = write_dynamic_manifest(
                     manifest_directory,
                     dynamic_records,
-                    metadata={
-                        "webui_url": self.url_var.get().strip(),
-                        "prompt_file": str(Path(self.prompt_path_var.get()).resolve()),
-                        "payload_file": str(Path(self.payload_path_var.get()).resolve()),
-                        "wildcard_directories": [str(path) for path in expander.directories],
-                        "base_payload": base_payload,
-                    },
+                    metadata=manifest_metadata,
                 )
-            timeout = self._parse_timeout()
-            client_options = {
-                "base_url": self.url_var.get().strip(),
-                "timeout": timeout,
-                "username": self.username_var.get().strip() or None,
-                "password": self.password_var.get() or None,
-            }
-            stop_on_error = self.stop_on_error_var.get()
-        except (DynamicPromptError, ValueError, PromptParseError) as error:
-            messagebox.showerror("設定エラー", str(error))
+
+            if self.stop_after_current.is_set():
+                self.events.put(("prepare_cancelled", {"run_id": run_id}))
+                return
+        except Exception as error:
+            self.events.put(
+                (
+                    "prepare_failed",
+                    {"run_id": run_id, "error": str(error)},
+                )
+            )
             return
 
-        self.stop_after_current.clear()
-        self.interrupt_requested.clear()
-        self.skip_requested.clear()
-        self.progress_poll_warning_sent.clear()
-        self.active_run_id += 1
-        run_id = self.active_run_id
-        total_images = sum(chunk.image_count for _, chunks in job_plans for chunk in chunks)
-        total_requests = sum(len(chunks) for _, chunks in job_plans)
-        self.progress.configure(maximum=max(total_images, 1), value=0)
-        self.status_var.set("準備中")
-        self.webui_controls_enabled = not dry_run
-        self._set_running(True)
-        self._clear_log()
-        mode = "dry-run" if dry_run else "generation"
-        self._append_log(
-            f"Starting {mode}: {len(jobs)} job(s), {total_images} image(s), "
-            f"{total_requests} request(s)"
+        self.events.put(
+            (
+                "plan_ready",
+                {
+                    "run_id": run_id,
+                    "dry_run": dry_run,
+                    "job_count": len(jobs),
+                    "total_images": total_images,
+                    "total_requests": total_requests,
+                    "request_image_limit": (
+                        1 if expander is not None else DEFAULT_MAX_IMAGES_PER_REQUEST
+                    ),
+                    "manifest_path": str(manifest_path) if manifest_path else "",
+                },
+            )
         )
-        self._append_log(
-            f"Each request is limited to "
-            f"{1 if expander is not None else DEFAULT_MAX_IMAGES_PER_REQUEST} image(s); "
-            "grid creation is disabled."
+        self._run_jobs(
+            run_id,
+            job_plans,
+            client_options,
+            stop_on_error,
+            dry_run,
         )
-        if manifest_path is not None:
-            self._append_log(f"Dynamic prompt manifest: {manifest_path}")
-
-        self.worker = threading.Thread(
-            target=self._run_jobs,
-            args=(run_id, job_plans, client_options, stop_on_error, dry_run),
-            daemon=True,
-        )
-        self.worker.start()
 
     def _run_jobs(
         self,
@@ -718,29 +832,29 @@ class BatchRunnerApp:
         try:
             for number, (job, chunks) in enumerate(job_plans, start=1):
                 subdir = chunks[0].payload["override_settings"]["directories_filename_pattern"]
-                self.events.put(("log", f"\nJob {number}/{len(job_plans)}: {job.title}"))
-                self.events.put(("log", f"subdirectory: {subdir}"))
-                self.events.put(
-                    (
-                        "log",
-                        f"{chunks[0].total_images} image(s) in {len(chunks)} request(s)",
-                    )
-                )
 
                 if dry_run:
-                    for chunk in chunks:
-                        self.events.put(
-                            (
-                                "log",
-                                f"request {chunk.ordinal}/{chunk.total_chunks}: images "
-                                f"{chunk.image_start}-{chunk.image_end}/{chunk.total_images}, "
-                                f"n_iter={chunk.payload['n_iter']}, "
-                                f"seed={chunk.payload.get('seed', 'default')}",
-                            )
-                        )
-                    self.events.put(("log", "first request payload:"))
                     self.events.put(
-                        ("log", json.dumps(chunks[0].payload, ensure_ascii=False, indent=2))
+                        (
+                            "log",
+                            "\n".join(
+                                [
+                                    f"\nJob {number}/{len(job_plans)}: {job.title}",
+                                    f"subdirectory: {subdir}",
+                                    (
+                                        f"{chunks[0].total_images} image(s) in "
+                                        f"{len(chunks)} request(s)"
+                                    ),
+                                    *format_dry_run_request_lines(chunks),
+                                    "first request payload:",
+                                    json.dumps(
+                                        chunks[0].payload,
+                                        ensure_ascii=False,
+                                        indent=2,
+                                    ),
+                                ]
+                            ),
+                        )
                     )
                     confirmed_images += chunks[0].total_images
                     self._put_run_progress(
@@ -753,6 +867,15 @@ class BatchRunnerApp:
                         phase="dry_run",
                     )
                     continue
+
+                self.events.put(("log", f"\nJob {number}/{len(job_plans)}: {job.title}"))
+                self.events.put(("log", f"subdirectory: {subdir}"))
+                self.events.put(
+                    (
+                        "log",
+                        f"{chunks[0].total_images} image(s) in {len(chunks)} request(s)",
+                    )
+                )
 
                 for chunk in chunks:
                     if self.stop_after_current.is_set():
@@ -1028,7 +1151,10 @@ class BatchRunnerApp:
 
     def request_stop(self) -> None:
         self.stop_after_current.set()
-        self._append_log("Stop requested. 現在の送信完了後に停止します。")
+        if getattr(self, "run_preparing", False):
+            self._append_log("準備の停止を要求しました。")
+        else:
+            self._append_log("Stop requested. 現在の送信完了後に停止します。")
 
     def interrupt_webui(self) -> None:
         if not self._control_is_available():
@@ -1089,14 +1215,79 @@ class BatchRunnerApp:
         )
 
     def _drain_events(self) -> None:
+        processed = 0
         try:
-            while True:
+            while processed < EVENT_DRAIN_BATCH_SIZE:
                 event, value = self.events.get_nowait()
+                processed += 1
                 if event == "log":
                     self._append_log(str(value))
                 elif event == "control_done":
                     self.control_in_flight.clear()
                     self._refresh_action_states()
+                elif event == "planning_progress":
+                    progress_data = dict(value)
+                    if progress_data.get("run_id") != self.active_run_id:
+                        continue
+                    number = int(progress_data["job_number"])
+                    total = int(progress_data["job_total"])
+                    self.progress.configure(maximum=max(total, 1), value=number)
+                    self.status_var.set(
+                        f"準備中: {number}/{total}ジョブ｜"
+                        f"{int(progress_data['total_images'])}枚｜"
+                        f"{int(progress_data['total_requests'])}送信"
+                    )
+                elif event == "plan_ready":
+                    plan_data = dict(value)
+                    if plan_data.get("run_id") != self.active_run_id:
+                        continue
+                    self.run_preparing = False
+                    self.webui_controls_enabled = not bool(plan_data["dry_run"])
+                    self._refresh_action_states()
+                    total_images = int(plan_data["total_images"])
+                    total_requests = int(plan_data["total_requests"])
+                    self.progress.configure(maximum=max(total_images, 1), value=0)
+                    mode = "dry-run" if plan_data["dry_run"] else "generation"
+                    self.status_var.set(
+                        f"準備完了: {total_images}枚 / {total_requests}送信"
+                    )
+                    self._append_log(
+                        f"Starting {mode}: {int(plan_data['job_count'])} job(s), "
+                        f"{total_images} image(s), {total_requests} request(s)"
+                    )
+                    self._append_log(
+                        f"Each request is limited to "
+                        f"{int(plan_data['request_image_limit'])} image(s); "
+                        "grid creation is disabled."
+                    )
+                    if plan_data.get("manifest_path"):
+                        self._append_log(
+                            f"Dynamic prompt manifest: {plan_data['manifest_path']}"
+                        )
+                elif event == "prepare_failed":
+                    failed_data = dict(value)
+                    if failed_data.get("run_id") != self.active_run_id:
+                        continue
+                    self.run_preparing = False
+                    self._set_running(False)
+                    self.progress.configure(value=0)
+                    self.status_var.set("準備失敗")
+                    error = str(
+                        failed_data.get("error", "Unknown preparation error")
+                    )
+                    self._append_log(f"Preparation failed: {error}")
+                    messagebox.showerror("設定エラー", error)
+                elif event == "prepare_cancelled":
+                    cancelled_data = dict(value)
+                    if cancelled_data.get("run_id") != self.active_run_id:
+                        continue
+                    self.run_preparing = False
+                    self._set_running(False)
+                    self.progress.configure(value=0)
+                    self.status_var.set("準備を停止しました")
+                    self._append_log(
+                        "Preparation stopped before any API request was sent."
+                    )
                 elif event == "run_progress":
                     progress_data = dict(value)
                     if progress_data.get("run_id") != self.active_run_id:
@@ -1117,6 +1308,7 @@ class BatchRunnerApp:
                     skipped_requests = int(done_data.get("skipped_requests", 0))
                     confirmed = int(done_data["confirmed_images"])
                     total = int(done_data["total_images"])
+                    self.run_preparing = False
                     self._set_running(False)
                     if done_data.get("dry_run"):
                         self.progress.configure(value=total)
@@ -1162,12 +1354,13 @@ class BatchRunnerApp:
         except queue.Empty:
             pass
 
-        self.root.after(100, self._drain_events)
+        self.root.after(10 if not self.events.empty() else 100, self._drain_events)
 
     def _set_running(self, running: bool) -> None:
         self.generation_running = running
         if not running:
             self.webui_controls_enabled = False
+            self.run_preparing = False
         self._refresh_action_states()
         if not running:
             self.stop_after_current.clear()

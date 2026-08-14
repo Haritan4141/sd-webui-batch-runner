@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from sd_webui_batch.batching import split_payload_into_chunks
 from sd_webui_batch.client import SdWebuiApiError, SdWebuiTransportError
-from sd_webui_batch.gui import BatchRunnerApp
+from sd_webui_batch.gui import BatchRunnerApp, format_dry_run_request_lines
 from sd_webui_batch.parser import PromptJob
 
 
@@ -89,6 +89,88 @@ class GuiRunnerTests(unittest.TestCase):
             [update["confirmed_images"] for update in completed_updates],
             [100, 200, 250],
         )
+
+    def test_large_dry_run_request_list_is_compacted(self):
+        job = PromptJob(
+            index=1,
+            title="large-preview",
+            prompt="prompt",
+            line_number=1,
+        )
+        chunks = split_payload_into_chunks(
+            {
+                "n_iter": 100,
+                "batch_size": 1,
+                "seed": 1,
+                "override_settings": {
+                    "directories_filename_pattern": job.title,
+                },
+            },
+            max_images_per_request=1,
+        )
+
+        lines = format_dry_run_request_lines(chunks)
+
+        self.assertEqual(len(lines), 13)
+        self.assertIn("88 request(s) omitted", lines[6])
+        self.assertTrue(lines[0].startswith("request 1/100"))
+        self.assertTrue(lines[-1].startswith("request 100/100"))
+
+    def test_start_worker_runs_preparation_in_background(self):
+        app = self._make_app()
+        app.worker = None
+        app.active_run_id = 0
+        app.run_preparing = False
+        app._selected_jobs = Mock(
+            return_value=[
+                PromptJob(
+                    index=1,
+                    title="background-plan",
+                    prompt="prompt",
+                    line_number=1,
+                )
+            ]
+        )
+        app._collect_base_payload = Mock(return_value={"n_iter": 100})
+        app._build_cli_args = Mock(return_value=Mock())
+        app._parse_timeout = Mock(return_value=10)
+        app._set_running = Mock()
+        app._clear_log = Mock()
+        app._append_log = Mock()
+        app.progress = Mock()
+        app.status_var = Mock()
+        app.dynamic_prompts_var = Mock(get=Mock(return_value=False))
+        app.wildcards_dir_var = Mock(get=Mock(return_value=""))
+        app.manifest_dir_var = Mock(get=Mock(return_value="manifests"))
+        app.url_var = Mock(get=Mock(return_value="http://example"))
+        app.username_var = Mock(get=Mock(return_value=""))
+        app.password_var = Mock(get=Mock(return_value=""))
+        app.stop_on_error_var = Mock(get=Mock(return_value=False))
+        app.prompt_path_var = Mock(get=Mock(return_value="prompts.txt"))
+        app.payload_path_var = Mock(get=Mock(return_value="payload.json"))
+
+        started = threading.Event()
+        release = threading.Event()
+        ran_off_main_thread = []
+
+        def slow_preparation(*_args):
+            ran_off_main_thread.append(
+                threading.current_thread() is not threading.main_thread()
+            )
+            started.set()
+            release.wait(timeout=2)
+
+        app._prepare_and_run_jobs = slow_preparation
+
+        app._start_worker(dry_run=True)
+
+        self.assertTrue(started.wait(timeout=0.5))
+        self.assertTrue(app.worker.is_alive())
+        self.assertEqual(ran_off_main_thread, [True])
+        self.assertTrue(app.run_preparing)
+        release.set()
+        app.worker.join(timeout=1)
+        self.assertFalse(app.worker.is_alive())
 
     def test_http_error_skips_remaining_chunks_but_starts_next_job(self):
         app = self._make_app()

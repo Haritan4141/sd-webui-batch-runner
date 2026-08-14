@@ -365,6 +365,8 @@ GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`
   - Upscalerの既定規則を `iwn / ata → Lanczos`、その他の現行絵柄 → `Latent (antialiased)` へ更新した。旧既定値または空の規則だけを一度移行し、別の個別設定は保持する。
   - 依頼状態とプロンプト状態のGUI表示、状態選択、関連ボタンを日本語化した。DB内部値は互換性維持のため変更していない。67テストとGUIでの完了非表示・再表示テストに成功した。
   - RequestSet書き出し順を依頼IDの昇順に固定した。依頼Inboxの新しい順表示やGUIの選択順に影響されず、今後の生成順はID 1→Nとなる。既存を含む68テスト成功。
+  - 大量Dynamic PromptsのDry Run準備をバックグラウンド化し、準備進捗表示、準備中の停止、GUIログのリクエスト要約、イベント処理の分割を追加した。Manifestには全件を引き続き保存する。73ジョブ×100枚の実データDry Runでボタン復帰約0.014秒、全準備・確認約0.99秒、GUI応答維持を確認し、既存を含む71テスト成功。
+  - `run_forge_neo_gui.bat` と `examples/payload_forge_neo.json` を共有対象にした。BATはメインPCのZドライブ構成とサブPCの `C:\[wildcards]\wildcards` を自動判別し、Manifest先もPC構成に合わせて切り替える。
 
 - 2026-05-12
   - 初版作成。

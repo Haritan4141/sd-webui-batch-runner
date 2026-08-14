@@ -42,6 +42,9 @@ GUIでは、プロンプトファイル、Payload JSON、WebUI URL、生成枚�
 
 `Dry Run` は画像生成せず、WebUIへ送る予定のpayloadをログに表示します。
 `Payload JSON` の `保存` は、GUI上の設定をJSONファイルへ書き戻します。
+大量のRunner Dynamic Promptsを使うDry Runは、展開とManifest作成をバックグラウンドで行います。準備中もGUIは応答し、状態欄に進捗を表示します。GUIログのリクエスト一覧は先頭・末尾の要約表示にしますが、展開した全件は従来どおりManifest JSONへ保存されます。
+
+Forge Neo高速版は `run_forge_neo_gui.bat` から起動します。WebUI URLは `http://127.0.0.1:7861`、Payloadは `examples/payload_forge_neo.json`、Runner Dynamic Promptsは有効で起動します。ワイルドカードは `C:\[wildcards]\wildcards` またはメインPCのStabilityMatrix配下を自動選択し、Manifest先もZドライブがないPCではユーザーのDocuments配下へ切り替えます。
 
 ## SQLiteプロンプトライブラリ（段階導入版）
 
