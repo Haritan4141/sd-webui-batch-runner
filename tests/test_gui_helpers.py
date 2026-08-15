@@ -28,6 +28,44 @@ from sd_webui_batch.prompt_library import REQUEST_STATUSES
 
 
 class GuiProgressHelperTests(unittest.TestCase):
+    def test_open_replaces_visible_promptsets_and_add_accumulates_them(self):
+        window = PromptLibraryWindow.__new__(PromptLibraryWindow)
+        window.window = Mock()
+        window.library = Mock()
+        window.library.open_prompt_set.return_value = SimpleNamespace(
+            collection_id=10,
+            created=True,
+            total=64,
+            added=64,
+            updated=0,
+            removed=0,
+        )
+        window.library.import_prompt_set.side_effect = ((20, 10), (30, 4))
+        window.library.collection_job_ids.side_effect = (
+            (101,),
+            (201,),
+            (301,),
+        )
+        window.dirty_promptset_ids = set()
+        window.visible_promptset_collection_ids = {99}
+        window.show_current_promptset_only_var = Mock()
+        window.reload = Mock()
+        window.notebook = Mock()
+        window._set_active_promptset = Mock()
+
+        with patch(
+            "sd_webui_batch.library_gui.filedialog.askopenfilename",
+            side_effect=("first.json", "second.json", "third.json"),
+        ), patch("sd_webui_batch.library_gui.messagebox.showinfo"):
+            window.open_prompt_set()
+            self.assertEqual(window.visible_promptset_collection_ids, {10})
+
+            window.add_prompt_set()
+            window.add_prompt_set()
+
+        self.assertEqual(window.visible_promptset_collection_ids, {10, 20, 30})
+        window.show_current_promptset_only_var.set.assert_called_once_with(True)
+
     def test_requestset_export_uses_every_visible_request_without_selection(self):
         window = PromptLibraryWindow.__new__(PromptLibraryWindow)
         window.request_tree = Mock()
@@ -74,26 +112,27 @@ class GuiProgressHelperTests(unittest.TestCase):
             (1,),
         )
 
-    def test_prompt_display_can_limit_rows_to_the_open_collection(self):
+    def test_prompt_display_can_limit_rows_to_opened_and_added_collections(self):
         records = [
             SimpleNamespace(id=1, collection_id=10),
             SimpleNamespace(id=2, collection_id=10),
             SimpleNamespace(id=3, collection_id=20),
+            SimpleNamespace(id=4, collection_id=30),
         ]
 
         current = prompt_records_for_display(
             records,
-            current_collection_id=10,
+            visible_collection_ids={10, 20},
             current_only=True,
         )
         all_records = prompt_records_for_display(
             records,
-            current_collection_id=10,
+            visible_collection_ids={10, 20},
             current_only=False,
         )
 
-        self.assertEqual([record.id for record in current], [1, 2])
-        self.assertEqual([record.id for record in all_records], [1, 2, 3])
+        self.assertEqual([record.id for record in current], [1, 2, 3])
+        self.assertEqual([record.id for record in all_records], [1, 2, 3, 4])
 
     def test_library_statuses_have_reversible_japanese_labels(self):
         self.assertEqual(set(REQUEST_STATUS_LABELS), set(REQUEST_STATUSES))

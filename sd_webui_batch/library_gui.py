@@ -63,15 +63,15 @@ def request_status_matches_filter(status: str, filter_label: str) -> bool:
 def prompt_records_for_display(
     records: list[LibraryJob],
     *,
-    current_collection_id: int | None,
+    visible_collection_ids: set[int],
     current_only: bool,
 ) -> list[LibraryJob]:
-    if not current_only or current_collection_id is None:
+    if not current_only or not visible_collection_ids:
         return records
     return [
         record
         for record in records
-        if record.collection_id == current_collection_id
+        if record.collection_id in visible_collection_ids
     ]
 
 
@@ -131,6 +131,7 @@ class PromptLibraryWindow:
         self.collections: dict[int, PromptCollection] = {}
         self.current_job_id: int | None = None
         self.current_promptset_collection_id: int | None = None
+        self.visible_promptset_collection_ids: set[int] = set()
         self.dirty_promptset_ids: set[int] = set()
         self.requests: dict[int, RequestRecord] = {}
         self.current_request_id: int | None = None
@@ -340,7 +341,7 @@ class PromptLibraryWindow:
         ).grid(row=1, column=1, columnspan=4, sticky="w", padx=6, pady=(4, 0))
         ttk.Checkbutton(
             promptset_frame,
-            text="開いているPromptSetのみ表示",
+            text="開いた／追加したPromptSetのみ表示",
             variable=self.show_current_promptset_only_var,
             command=self._refresh_prompt_tree,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -622,6 +623,7 @@ class PromptLibraryWindow:
             if record.is_prompt_set and record.json_dirty
         }
         self.jobs = {record.id: record for record in records}
+        self.visible_promptset_collection_ids.intersection_update(self.collections)
         if self.current_promptset_collection_id not in self.collections:
             self.current_promptset_collection_id = None
         if (
@@ -632,6 +634,7 @@ class PromptLibraryWindow:
             newest_collection = self.collections.get(records[0].collection_id)
             if newest_collection is not None and newest_collection.is_prompt_set:
                 self.current_promptset_collection_id = newest_collection.id
+                self.visible_promptset_collection_ids.add(newest_collection.id)
 
         discovered_style_names = (
             {record.style_key for record in records if record.style_key}
@@ -659,7 +662,7 @@ class PromptLibraryWindow:
     def _refresh_prompt_tree(self, *, select_job_id: int | None = None) -> None:
         visible_records = prompt_records_for_display(
             list(self.jobs.values()),
-            current_collection_id=self.current_promptset_collection_id,
+            visible_collection_ids=self.visible_promptset_collection_ids,
             current_only=self.show_current_promptset_only_var.get(),
         )
         for item in self.tree.get_children():
@@ -784,6 +787,7 @@ class PromptLibraryWindow:
             return
         self.dirty_promptset_ids.discard(result.collection_id)
         self.current_promptset_collection_id = result.collection_id
+        self.visible_promptset_collection_ids = {result.collection_id}
         self.show_current_promptset_only_var.set(True)
         job_ids = self.library.collection_job_ids(result.collection_id)
         self.reload(select_job_id=job_ids[0] if job_ids else None)
@@ -814,7 +818,7 @@ class PromptLibraryWindow:
             messagebox.showerror("PromptSetを追加", str(error), parent=self.window)
             return
         self.current_promptset_collection_id = collection_id
-        self.show_current_promptset_only_var.set(True)
+        self.visible_promptset_collection_ids.add(collection_id)
         job_ids = self.library.collection_job_ids(collection_id)
         self.reload(select_job_id=job_ids[0] if job_ids else None)
         self.notebook.select(1)
