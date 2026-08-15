@@ -47,6 +47,9 @@ REQUEST_FILTER_CHOICES = (
 DEFAULT_PROMPTSET_DISTRIBUTION_DIR = (
     Path(__file__).resolve().parent.parent / "SD-PromptSets"
 )
+DEFAULT_REQUESTSET_EXPORT_DIR = (
+    Path.home() / "Documents" / "sd-webui-prompt-codex-generate"
+)
 
 
 def request_status_matches_filter(status: str, filter_label: str) -> bool:
@@ -475,8 +478,8 @@ class PromptLibraryWindow:
         export_actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         ttk.Button(
             export_actions,
-            text="選択をRequestSet JSONへ書出",
-            command=self.export_selected_request_set,
+            text="表示中をRequestSet JSONへ書出",
+            command=self.export_visible_request_set,
         ).pack(side="left")
         ttk.Label(
             export_actions,
@@ -1034,23 +1037,28 @@ class PromptLibraryWindow:
             return False
         return True
 
-    def export_selected_request_set(self) -> None:
-        ids = self._selected_request_ids()
+    def export_visible_request_set(self) -> None:
+        ids = tuple(int(item) for item in self.request_tree.get_children())
         if not ids:
             messagebox.showwarning(
                 "RequestSet書出",
-                "書き出す依頼を選択してください。",
+                "現在の状態フィルターに書き出せる依頼がありません。",
                 parent=self.window,
             )
             return
         if self.current_request_id in ids and not self._persist_current_request():
             return
+        initial_directory = (
+            DEFAULT_REQUESTSET_EXPORT_DIR
+            if DEFAULT_REQUESTSET_EXPORT_DIR.is_dir()
+            else self.library.path.parent
+        )
         path = filedialog.asksaveasfilename(
             parent=self.window,
-            title="生成ツール用RequestSet JSONを書き出す",
+            title="表示中の依頼をRequestSet JSONへ書き出す",
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            initialdir=str(self.library.path.parent),
+            initialdir=str(initial_directory),
             initialfile=f"{datetime.now():%Y%m%d}_RequestSet.json",
         )
         if not path:

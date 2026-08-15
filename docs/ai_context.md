@@ -373,7 +373,8 @@ GitHub リポジトリは `https://github.com/Haritan4141/sd-webui-batch-runner`
   - 配布先をプロジェクト内の `sd-webui-batch-runner/SD-PromptSets`（Git管理対象外）とし、9700X／14100Fは `\\DESKTOP-5NPLIIV\Users\Haritan\Documents\sd-webui-batch-runner\SD-PromptSets` のJSONを開いて各PCのローカルSQLiteへ取り込む運用にした。SQLite DB本体はPC間共有しない。共有JSONを開いた後はローカルSQLite、バッチへ渡した後はメモリ上のジョブを使うため、生成中のネットワーク切断は影響しない。共有JSONの保存・再読込時だけ接続が必要。
   - `開いているPromptSetのみ表示` を既定にし、PromptSetを開く／追加した直後は対象取込単位だけを表示する。件数欄は表示件数とDB全件数を分け、過去セットはチェックを外すと確認できる。旧コピーが残ってDB全体128件でも、開いた64件を追加と誤認しない表示にした。
   - `生成準備済み全件をバッチへ` を `表示中の生成準備済みをバッチへ` へ変更し、一覧で非表示になっている過去セットをバッチ対象から除外した。
-  - 新しいPromptSet開閉・同期・追加・保存・未知項目保持・バックアップ・配布設定・表示フィルター・schema移行テストを追加し、既存を含む77テスト成功。実際の64件PromptSetコピーでorder 1→64、source_request_id、編集内容、Upscalerを配布先DBまで往復確認した。
+  - RequestSet書き出しを選択項目ではなく状態フィルターで表示中の依頼すべてへ変更し、全選択を不要にした。既定保存先は各ユーザーの `Documents/sd-webui-prompt-codex-generate`（メインPCでは `C:\Users\Haritan\Documents\sd-webui-prompt-codex-generate`）。書き出し内部では引き続き依頼ID昇順に整列する。
+  - 新しいPromptSet開閉・同期・追加・保存・未知項目保持・バックアップ・配布設定・表示フィルター・RequestSet表示全件書き出し・schema移行テストを追加し、既存を含む79テスト成功。実際の64件PromptSetコピーでorder 1→64、source_request_id、編集内容、Upscalerを配布先DBまで往復確認した。
 
 - 2026-05-12
   - 初版作成。

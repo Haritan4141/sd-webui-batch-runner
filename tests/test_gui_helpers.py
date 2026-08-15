@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 from sd_webui_batch.gui import (
     calculate_job_plan_counts,
@@ -12,6 +13,8 @@ from sd_webui_batch.gui import (
 )
 from sd_webui_batch.library_gui import (
     DEFAULT_PROMPTSET_DISTRIBUTION_DIR,
+    DEFAULT_REQUESTSET_EXPORT_DIR,
+    PromptLibraryWindow,
     PROMPT_STATUS_LABELS,
     PROMPT_STATUS_VALUES,
     REQUEST_FILTER_CHOICES,
@@ -25,6 +28,32 @@ from sd_webui_batch.prompt_library import REQUEST_STATUSES
 
 
 class GuiProgressHelperTests(unittest.TestCase):
+    def test_requestset_export_uses_every_visible_request_without_selection(self):
+        window = PromptLibraryWindow.__new__(PromptLibraryWindow)
+        window.request_tree = Mock()
+        window.request_tree.get_children.return_value = ("3", "1", "2")
+        window.current_request_id = None
+        window.library = Mock()
+        window.library.path = Path("library.sqlite3")
+        window.window = Mock()
+        window.reload = Mock()
+
+        with patch(
+            "sd_webui_batch.library_gui.filedialog.asksaveasfilename",
+            return_value="RequestSet.json",
+        ), patch("sd_webui_batch.library_gui.messagebox.showinfo"):
+            window.export_visible_request_set()
+
+        window.library.export_request_set.assert_called_once_with(
+            "RequestSet.json", (3, 1, 2)
+        )
+
+    def test_requestset_export_folder_uses_generator_project(self):
+        self.assertEqual(
+            DEFAULT_REQUESTSET_EXPORT_DIR,
+            Path.home() / "Documents" / "sd-webui-prompt-codex-generate",
+        )
+
     def test_promptset_distribution_folder_is_inside_the_project(self):
         project_root = Path(__file__).resolve().parents[1]
         self.assertEqual(

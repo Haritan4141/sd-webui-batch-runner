@@ -57,7 +57,7 @@ GUIの `SQLite管理` から、受け取った依頼、生成済みプロンプ�
 3. `SQLite管理` を開く。
 4. 最初に開く `依頼Inbox` タブで、受け取った文章をコピーして `クリップボードから新規` を押す。手入力する場合は `新規` を使う。
 5. 自動で入ったキャラクター、絵柄、生成指示を確認する。必要なら `元文から候補抽出` を押し、修正後に `編集内容を保存` を押す。受取原文は候補とは別にそのまま保存される。
-6. プロンプト化する依頼を選び、`選択を生成待ち`、`選択をRequestSet JSONへ書出` の順に押す。出力名は `YYYYMMDD_RequestSet.json` が目安。
+6. プロンプト化する依頼を `選択を生成待ち` にし、必要な状態フィルターへ切り替えて `表示中をRequestSet JSONへ書出` を押す。全選択は不要で、現在表示中の依頼がすべてID昇順で出力される。既定の保存先は `Documents/sd-webui-prompt-codex-generate`、出力名は `YYYYMMDD_RequestSet.json`。
 7. RequestSet JSONは依頼IDの昇順で書き出される。そのJSONを `sd-webui-prompt-codex-generate` に渡す。生成側は確認用txtと `YYYYMMDD_PromptSet.json` を作成し、各プロンプトへ元の依頼IDを引き継ぐ。
 8. `PromptSetを開く` で結果を戻す。初回だけSQLiteへ作成され、同じJSONを開き直した場合は同じ取込単位が更新される。紐づいた依頼は `プロンプト生成済み` になる。
 9. プロンプト、絵柄、状態、生成対象、個別Upscalerを確認し、各項目の `編集内容を保存` を押す。編集が終わったら `JSONへ上書き保存` を押し、PromptSet JSON本体へ反映する。
