@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 from typing import Any, Iterable
@@ -121,6 +122,7 @@ class PromptSetSyncResult:
 
 
 LATENT_UPSCALER = "Latent (antialiased)"
+LANCZOS_UPSCALER = "Lanczos"
 DEFAULT_STYLE_RULES = (
     StyleRule("ノーマル", {"hr_upscaler": LATENT_UPSCALER}),
     StyleRule("ヌルテカ", {"hr_upscaler": LATENT_UPSCALER}),
@@ -129,20 +131,33 @@ DEFAULT_STYLE_RULES = (
     StyleRule("qwq", {"hr_upscaler": LATENT_UPSCALER}),
     StyleRule("lil", {"hr_upscaler": LATENT_UPSCALER}),
     StyleRule("kak", {"hr_upscaler": LATENT_UPSCALER}),
-    StyleRule("iwn", {"hr_upscaler": "Lanczos"}),
-    StyleRule("ata", {"hr_upscaler": "Lanczos"}),
+    StyleRule("jir", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("iwn", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("ata", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("foo", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("sym", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("ter", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("rub", {"hr_upscaler": LANCZOS_UPSCALER}),
+    StyleRule("moo", {"hr_upscaler": LANCZOS_UPSCALER}),
 )
 LEGACY_STYLE_RULE_DEFAULTS = {
     "ノーマル": {"hr_upscaler": LATENT_UPSCALER},
     "ヌルテカ": {"hr_upscaler": "Lanczos"},
     "mcp": {"hr_upscaler": LATENT_UPSCALER},
 }
+STYLE_CODE_SUFFIX_PATTERN = re.compile(r"[\(（]([^\(\)（）]+)[\)）]\s*$")
 
 
 def parse_style_prompt_catalog(text: str) -> tuple[str, ...]:
     """Return GUI style keys from the generator's ●-headed style prompt file."""
 
-    style_keys: list[str] = []
+    return tuple(rule.style_key for rule in _parse_style_prompt_catalog_rules(text))
+
+
+def _parse_style_prompt_catalog_rules(text: str) -> tuple[StyleRule, ...]:
+    """Return style keys and catalog-derived Upscaler defaults."""
+
+    rules: list[StyleRule] = []
     seen: set[str] = set()
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -151,16 +166,22 @@ def parse_style_prompt_catalog(text: str) -> tuple[str, ...]:
         heading = line[1:].strip()
         if heading in {"ノーマル", "ヌルテカ"}:
             style_key = heading
-        elif heading.endswith(")") and "(" in heading:
-            style_key = heading[heading.rfind("(") + 1 : -1].strip()
         else:
-            continue
+            match = STYLE_CODE_SUFFIX_PATTERN.search(heading)
+            if match is None:
+                continue
+            style_key = match.group(1).strip()
         folded = style_key.casefold()
         if not style_key or folded in seen:
             continue
         seen.add(folded)
-        style_keys.append(style_key)
-    return tuple(style_keys)
+        upscaler = (
+            LANCZOS_UPSCALER
+            if "lanczos" in heading.casefold()
+            else LATENT_UPSCALER
+        )
+        rules.append(StyleRule(style_key, {"hr_upscaler": upscaler}))
+    return tuple(rules)
 
 
 def merge_payload_overrides(
@@ -1036,32 +1057,52 @@ class PromptLibrary:
     def sync_style_prompt_catalog(
         self, path: str | Path = DEFAULT_STYLE_PROMPT_PATH
     ) -> tuple[str, ...]:
-        """Add style names from the generator catalog without overwriting rules."""
+        """Add catalog styles and fill empty rules without replacing custom rules."""
 
         source = Path(path)
         if not source.is_file():
             return ()
         try:
-            style_keys = parse_style_prompt_catalog(
+            catalog_rules = _parse_style_prompt_catalog_rules(
                 source.read_text(encoding="utf-8-sig")
             )
         except OSError as error:
             raise PromptLibraryError(f"絵柄一覧を読み込めません: {error}") from error
-        if not style_keys:
+        if not catalog_rules:
             return ()
+        style_keys = tuple(rule.style_key for rule in catalog_rules)
 
         self.initialize()
         now = _utc_now()
         with self._connection() as connection:
-            for style_key in style_keys:
-                connection.execute(
+            for rule in catalog_rules:
+                row = connection.execute(
                     """
-                    INSERT OR IGNORE INTO style_rules(
-                        style_key, settings_override_json, created_at, updated_at
-                    ) VALUES(?, '{}', ?, ?)
+                    SELECT settings_override_json
+                    FROM style_rules
+                    WHERE style_key = ?
                     """,
-                    (style_key, now, now),
-                )
+                    (rule.style_key,),
+                ).fetchone()
+                settings_json = _dump_object(rule.settings_override)
+                if row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO style_rules(
+                            style_key, settings_override_json, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?)
+                        """,
+                        (rule.style_key, settings_json, now, now),
+                    )
+                elif _load_object(row["settings_override_json"]) == {}:
+                    connection.execute(
+                        """
+                        UPDATE style_rules
+                        SET settings_override_json = ?, updated_at = ?
+                        WHERE style_key = ?
+                        """,
+                        (settings_json, now, rule.style_key),
+                    )
         return style_keys
 
     def set_style_rule(self, style_key: str, settings_override: dict[str, Any]) -> None:

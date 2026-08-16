@@ -7,6 +7,7 @@ import unittest
 
 from sd_webui_batch.cli import build_payload
 from sd_webui_batch.prompt_library import (
+    DEFAULT_STYLE_RULES,
     PromptLibrary,
     extract_request_candidates,
     parse_style_prompt_catalog,
@@ -14,16 +15,54 @@ from sd_webui_batch.prompt_library import (
 
 
 class PromptLibraryTests(unittest.TestCase):
+    def test_default_rules_include_catalog_styles_for_pcs_without_catalog_file(self):
+        rules = {rule.style_key: rule.hr_upscaler for rule in DEFAULT_STYLE_RULES}
+
+        for style_key in {"jir", "iwn", "ata", "foo", "sym", "ter", "rub", "moo"}:
+            self.assertEqual(rules[style_key], "Lanczos")
+        for style_key in {"ノーマル", "ヌルテカ", "bgk", "mcp", "qwq", "lil", "kak"}:
+            self.assertEqual(rules[style_key], "Latent (antialiased)")
+
     def test_parses_style_catalog_display_names(self):
         style_keys = parse_style_prompt_catalog(
             "●ノーマル\n,\n\n"
             "●ヌルテカ\nstyle prompt,\n\n"
             "●Blue_GK (bgk)\nstyle prompt,\n\n"
             "●むちぱん (mcp)\nstyle prompt,\n\n"
+            "●Artist style (qwq)\nstyle prompt,\n\n"
+            "●Lile リール Style - IL (lil)\nstyle prompt,\n\n"
+            "●かけうどん Style - IL (kak)\nstyle prompt,\n\n"
+            "●超ジロー Hires. fix Lanczos (jir)\nstyle prompt,\n\n"
+            "●岩野健太 自作 Hires. fix Lanczos (iwn)\nstyle prompt,\n\n"
+            "●atahuta 自作 Hires. fix Lanczos (ata)\nstyle prompt,\n\n"
+            "●ふおおおお 自作 Hires. fix Lanczos (foo)\nstyle prompt,\n\n"
+            "●シャーやま 自作 Hires. fix Lanczos (sym)\nstyle prompt,\n\n"
+            "●てるびぅむ 自作 Hires. fix Lanczos (ter)\nstyle prompt,\n\n"
+            "●るべゑ 自作 Hires. fix Lanczos (rub)\nstyle prompt,\n\n"
+            "●Moo 自作 Hires. fix Lanczos (moo)\nstyle prompt,\n\n"
             "●括弧なしの追加絵柄\nstyle prompt,\n"
         )
 
-        self.assertEqual(style_keys, ("ノーマル", "ヌルテカ", "bgk", "mcp"))
+        self.assertEqual(
+            style_keys,
+            (
+                "ノーマル",
+                "ヌルテカ",
+                "bgk",
+                "mcp",
+                "qwq",
+                "lil",
+                "kak",
+                "jir",
+                "iwn",
+                "ata",
+                "foo",
+                "sym",
+                "ter",
+                "rub",
+                "moo",
+            ),
+        )
 
     def test_syncs_style_catalog_without_overwriting_upscaler_rules(self):
         with TemporaryDirectory() as directory:
@@ -34,7 +73,9 @@ class PromptLibraryTests(unittest.TestCase):
                 "●ヌルテカ\nstyle prompt,\n\n"
                 "●Blue_GK (bgk)\nstyle prompt,\n\n"
                 "●むちぱん (mcp)\nstyle prompt,\n\n"
-                "●Artist style (qwq)\nstyle prompt,\n",
+                "●Artist style (qwq)\nstyle prompt,\n\n"
+                "●超ジロー Hires. fix Lanczos (jir)\nstyle prompt,\n\n"
+                "●岩野健太 自作 Hires. fix Lanczos (iwn)\nstyle prompt,\n",
                 encoding="utf-8",
             )
             library = PromptLibrary(root / "library.sqlite3")
@@ -46,12 +87,35 @@ class PromptLibraryTests(unittest.TestCase):
             request_id = library.create_request("test character bgk composition")
 
             self.assertEqual(
-                style_keys, ("ノーマル", "ヌルテカ", "bgk", "mcp", "qwq")
+                style_keys,
+                ("ノーマル", "ヌルテカ", "bgk", "mcp", "qwq", "jir", "iwn"),
             )
             self.assertEqual(rules["mcp"].hr_upscaler, "R-ESRGAN 4x+")
             self.assertEqual(rules["bgk"].hr_upscaler, "Latent (antialiased)")
             self.assertEqual(rules["qwq"].hr_upscaler, "Latent (antialiased)")
+            self.assertEqual(rules["jir"].hr_upscaler, "Lanczos")
+            self.assertEqual(rules["iwn"].hr_upscaler, "Lanczos")
             self.assertEqual(library.get_request(request_id).style_key, "bgk")
+
+    def test_catalog_sync_fills_empty_rule_without_overwriting_custom_rule(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = root / "0_SDXL Style Prompt.txt"
+            catalog.write_text(
+                "●超ジロー Hires. fix Lanczos (jir)\nstyle prompt,\n\n"
+                "●Artist style (qwq)\nstyle prompt,\n",
+                encoding="utf-8",
+            )
+            library = PromptLibrary(root / "library.sqlite3")
+            library.initialize()
+            library.set_style_rule("jir", {})
+            library.set_style_rule("qwq", {"hr_upscaler": "R-ESRGAN 4x+"})
+
+            library.sync_style_prompt_catalog(catalog)
+            rules = {rule.style_key: rule for rule in library.list_style_rules()}
+
+            self.assertEqual(rules["jir"].hr_upscaler, "Lanczos")
+            self.assertEqual(rules["qwq"].hr_upscaler, "R-ESRGAN 4x+")
 
     def test_imports_legacy_text_and_resolves_style_upscalers(self):
         with TemporaryDirectory() as directory:
